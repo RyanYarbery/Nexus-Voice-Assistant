@@ -1,0 +1,43 @@
+# Credentials and local configuration
+.env
+env
+*.env
+settings.json
+alarms.json
+
+# Biometric profiles, wake models, and downloaded ML models
+models/
+*.pt
+*.pth
+*.onnx
+*.ckpt
+*.safetensors
+
+# Audio and generated media
+*.wav
+*.mp3
+*.flac
+*.ogg
+
+# Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs, local state, and backups
+*.log
+*.json.tmp
+*.backup
+*.bak
+*.old
+*before*
+echo_*.py
+
+# Editor and OS metadata
+.idea/
+.vscode/
+.DS_Store

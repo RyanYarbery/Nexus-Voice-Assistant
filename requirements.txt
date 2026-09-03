@@ -1,0 +1,6 @@
+numpy
+openwakeword
+sounddevice
+speechbrain
+torch
+websockets
