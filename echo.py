@@ -38,6 +38,8 @@ from speechbrain.inference.speaker import SpeakerRecognition
 INPUT_RATE = 16000
 MODEL_RATE = 24000
 OUTPUT_RATE = 48000
+# Verified USB playback format: 16 kHz, stereo, signed 16-bit PCM.
+AEC_REFERENCE_RATE = 16000
 
 BASE_DIR = Path(
     os.environ.get(
@@ -126,30 +128,18 @@ FOLLOWUP_VERIFY_SECONDS = 2.2
 FOLLOWUP_OVERLAP_SECONDS = 0.6
 
 # =========================================================
-# CONVERSATIONAL BARGE-IN
+# HEY NEXUS BARGE-IN
 # =========================================================
 #
-# While Nexus is speaking, monitor the XVF3800 AEC residual
-# for near-end speech. Once enough speech is present, verify
-# that it matches the enrolled speaker. If it does, stop
-# Nexus and preserve the speech already captured so the
-# beginning of the interruption is not lost.
+# While Nexus is speaking, send the same PCM audio to the
+# audible Dell output and the XVF3800 USB playback endpoint.
+# The XVF3800 uses that silent digital copy as its far-end AEC
+# reference. CH0 is the strongly echo-cancelled channel used
+# for interruption detection; CH1 is retained for diagnostics.
+# Requiring the wake phrase prevents ordinary nearby speech
+# from being mistaken for an interruption.
 
-BARGE_VERIFY_SECONDS = 0.55
-
-# Retain a little audio before the point where speech becomes
-# strong enough to trigger verification.
-BARGE_PREROLL_SECONDS = 0.40
-
-# Minimum RMS required before we treat the AEC residual as
-# possible near-end speech. This prevents Marin's tiny AEC
-# residue from constantly invoking speaker recognition.
-BARGE_RMS_THRESHOLD = 40.0
-
-# Speaker-recognition threshold used only while Nexus talks.
-# Slightly lower than the normal 0.30 threshold because the
-# speech is passing through AEC while Marin is playing.
-BARGE_SPEAKER_THRESHOLD = 0.24
+BARGE_WAKE_THRESHOLD = 0.30
 
 BARGE_DEBUG = True
 BARGE_DEBUG_INTERVAL_SECONDS = 0.50
@@ -257,6 +247,11 @@ INPUT_DEVICE = find_device(
 
 OUTPUT_DEVICE = find_device(
     SPEAKER_NAME,
+    need_output=True,
+)
+
+AEC_REFERENCE_DEVICE = find_device(
+    MIC_NAME,
     need_output=True,
 )
 
@@ -400,33 +395,6 @@ def close_input_stream():
         stream.close()
     except Exception:
         pass
-
-
-async def reopen_input_stream_after_route(
-    route_mode,
-):
-    await asyncio.to_thread(
-        close_input_stream
-    )
-
-    await set_respeaker_route_async(
-        route_mode
-    )
-
-    await asyncio.sleep(
-        0.15
-    )
-
-    clear_mic_queue()
-    clear_barge_queue()
-
-    await asyncio.to_thread(
-        open_input_stream
-    )
-
-    await asyncio.sleep(
-        0.10
-    )
 
 
 # =========================================================
@@ -2456,21 +2424,17 @@ def reset_wake_detectors(
 
 
 async def monitor_barge_in(
-    controller,
+    barge_wake_models,
 ):
     loop = asyncio.get_running_loop()
 
-    preroll = deque()
-    speech_blocks = []
-
-    preroll_samples = int(
-        BARGE_PREROLL_SECONDS
-        * INPUT_RATE
+    reset_wake_detectors(
+        barge_wake_models
     )
 
+    peak0 = 0.0
+    peak1 = 0.0
     last_print = time.monotonic()
-    peak_rms0 = 0.0
-    peak_rms1 = 0.0
 
     while True:
         block = await loop.run_in_executor(
@@ -2479,25 +2443,35 @@ async def monitor_barge_in(
         )
 
         if not assistant_speaking.is_set():
-            preroll.clear()
-            speech_blocks.clear()
-            peak_rms0 = 0.0
-            peak_rms1 = 0.0
+            peak0 = 0.0
+            peak1 = 0.0
             last_print = time.monotonic()
+
+            reset_wake_detectors(
+                barge_wake_models
+            )
             continue
 
-        rms0, rms1 = block_rms(
-            block
+        ch0, ch1 = block
+
+        score0 = get_wake_score(
+            barge_wake_models[0],
+            ch0,
         )
 
-        peak_rms0 = max(
-            peak_rms0,
-            rms0,
+        score1 = get_wake_score(
+            barge_wake_models[1],
+            ch1,
         )
 
-        peak_rms1 = max(
-            peak_rms1,
-            rms1,
+        peak0 = max(
+            peak0,
+            score0,
+        )
+
+        peak1 = max(
+            peak1,
+            score1,
         )
 
         now = time.monotonic()
@@ -2509,192 +2483,54 @@ async def monitor_barge_in(
             >= BARGE_DEBUG_INTERVAL_SECONDS
         ):
             print(
-                "BARGE VOICE DEBUG peak "
-                f"CH0={peak_rms0:.1f} "
-                f"CH1={peak_rms1:.1f}",
+                "BARGE DEBUG peak "
+                f"CH0(AEC)={peak0:.3f} "
+                f"CH1(residual)={peak1:.3f}",
                 flush=True,
             )
 
-            peak_rms0 = 0.0
-            peak_rms1 = 0.0
+            peak0 = 0.0
+            peak1 = 0.0
             last_print = now
 
-        # Always retain a short rolling window so we can keep
-        # the beginning of the user's sentence.
-        preroll.append(
-            (
-                block[0].copy(),
-                block[1].copy(),
-            )
-        )
-
-        while (
-            preroll
-            and
-            samples_in_blocks(preroll)
-            > preroll_samples
-        ):
-            preroll.popleft()
-
-        # We are not currently evaluating a possible interruption.
-        # Wait until the AEC residual contains enough energy to
-        # plausibly be near-end speech.
-        if not speech_blocks:
-            if (
-                max(rms0, rms1)
-                < BARGE_RMS_THRESHOLD
-            ):
-                continue
-
-            speech_blocks = list(
-                preroll
-            )
-
-        else:
-            speech_blocks.append(
-                (
-                    block[0].copy(),
-                    block[1].copy(),
-                )
-            )
-
-        if not blocks_have_seconds(
-            speech_blocks,
-            BARGE_VERIFY_SECONDS,
-        ):
-            continue
-
-        audio0 = np.concatenate(
-            select_channel_blocks(
-                speech_blocks,
-                0,
-            )
-        )
-
-        audio1 = np.concatenate(
-            select_channel_blocks(
-                speech_blocks,
-                1,
-            )
-        )
-
-        similarity0, similarity1 = (
-            await asyncio.gather(
-                asyncio.to_thread(
-                    speaker_similarity,
-                    controller.recognizer,
-                    controller.enrolled_embeddings[0],
-                    audio0,
-                ),
-                asyncio.to_thread(
-                    speaker_similarity,
-                    controller.recognizer,
-                    controller.enrolled_embeddings[1],
-                    audio1,
-                ),
-            )
-        )
-
-        winner = (
-            0
-            if similarity0 >= similarity1
-            else 1
-        )
-
-        best_similarity = max(
-            similarity0,
-            similarity1,
-        )
-
-        print(
-            "Barge speaker check "
-            f"CH0={similarity0:.3f} "
-            f"CH1={similarity1:.3f} "
-            f"winner=CH{winner}",
-            flush=True,
-        )
-
+        # The controlled dual-output test measured 38.1 dB of
+        # echo reduction on CH0, versus only 2.4 dB on CH1.
+        # Trigger exclusively from the strongly cancelled CH0
+        # path so Nexus's own playback cannot dominate detection.
         if (
             assistant_speaking.is_set()
             and
-            best_similarity
-            >= BARGE_SPEAKER_THRESHOLD
+            score0 >= BARGE_WAKE_THRESHOLD
         ):
             print()
             print(
-                "*** CONVERSATIONAL INTERRUPTION DETECTED ***",
-                flush=True,
+                "*** HEY NEXUS INTERRUPT DETECTED ***"
             )
 
             print(
-                f"Interrupting for enrolled speaker "
-                f"on CH{winner}.",
-                flush=True,
+                "Interrupt wake "
+                f"CH0(AEC): {score0:.3f}   "
+                f"CH1(residual): {score1:.3f}"
             )
-
-            # Save everything already spoken during the
-            # interruption. The follow-up logic will consume this
-            # instead of making the user repeat the beginning.
-            controller.interrupt_blocks = [
-                (
-                    saved_block[0].copy(),
-                    saved_block[1].copy(),
-                )
-                for saved_block
-                in speech_blocks
-            ]
-
-            controller.active_channel = winner
 
             barge_in_event.set()
 
-            speech_blocks.clear()
-            preroll.clear()
+            clear_barge_queue()
 
-            # Playback may take a few milliseconds to notice the
-            # interruption. Keep collecting anything the user says
-            # during that transition instead of throwing it away.
+            reset_wake_detectors(
+                barge_wake_models
+            )
+
+            peak0 = 0.0
+            peak1 = 0.0
+            last_print = time.monotonic()
+
             while assistant_speaking.is_set():
-                try:
-                    extra_block = (
-                        barge_queue.get_nowait()
-                    )
-
-                    controller.interrupt_blocks.append(
-                        (
-                            extra_block[0].copy(),
-                            extra_block[1].copy(),
-                        )
-                    )
-
-                except queue.Empty:
-                    await asyncio.sleep(
-                        0.01
-                    )
-
-            # Grab anything that reached the barge queue immediately
-            # before playback shut down.
-            while True:
-                try:
-                    extra_block = (
-                        barge_queue.get_nowait()
-                    )
-
-                    controller.interrupt_blocks.append(
-                        (
-                            extra_block[0].copy(),
-                            extra_block[1].copy(),
-                        )
-                    )
-
-                except queue.Empty:
-                    break
+                await asyncio.sleep(
+                    0.02
+                )
 
             continue
-
-        # Candidate audio was not the enrolled speaker.
-        # Go back to monitoring without interrupting Nexus.
-        speech_blocks.clear()
 
 
 # =========================================================
@@ -2812,30 +2648,33 @@ async def play_response_audio(
         OUTPUT_RATE,
     )
 
+    # Resample the complete reference once; never restart resampling at
+    # chunk boundaries. The two devices consume different frame counts
+    # for the same amount of real time.
+    reference_pcm = resample_int16(
+        pcm_48k, OUTPUT_RATE, AEC_REFERENCE_RATE,
+    )
+
     barge_in_event.clear()
     clear_barge_queue()
     clear_mic_queue()
 
-    stream = None
-    route_changed = False
+    audible_stream = None
+    reference_stream = None
+    playback_stage = "opening Dell speaker output (48000 Hz, mono)"
 
     try:
-        # Close and reopen the ALSA input stream around the
-        # XVF3800 route change so CH1 actually reflects the
-        # amplified-microphone path while Nexus is speaking.
-        await reopen_input_stream_after_route(
-            "barge-on"
-        )
-
-        route_changed = True
-
+        # Keep the microphone stream open continuously. The
+        # XVF3800 AEC-residual route is established once during
+        # startup, so closing and reopening PortAudio here adds no
+        # routing benefit and can hang inside ALSA stream.start().
         assistant_speaking.set()
 
         chunk_frames = int(
             OUTPUT_RATE * 0.05
         )
 
-        stream = sd.OutputStream(
+        audible_stream = sd.OutputStream(
             samplerate=OUTPUT_RATE,
             device=OUTPUT_DEVICE,
             channels=1,
@@ -2843,7 +2682,24 @@ async def play_response_audio(
             blocksize=chunk_frames,
         )
 
-        stream.start()
+        # The ReSpeaker analog jack remains disconnected. This
+        # second stream supplies only the digital far-end signal
+        # required by the XVF3800's hardware echo canceller.
+        playback_stage = "opening ReSpeaker AEC reference (16000 Hz, stereo)"
+        reference_stream = sd.OutputStream(
+            samplerate=AEC_REFERENCE_RATE,
+            device=AEC_REFERENCE_DEVICE,
+            channels=2,
+            dtype="int16",
+            blocksize=int(AEC_REFERENCE_RATE * 0.05),
+        )
+
+        # Start the reference first. Separate USB/Dell clocks and driver
+        # buffering still require a physical echo-cancellation test.
+        playback_stage = "starting ReSpeaker AEC reference"
+        reference_stream.start()
+        playback_stage = "starting Dell speaker output"
+        audible_stream.start()
 
         position = 0
 
@@ -2858,47 +2714,80 @@ async def play_response_audio(
                 position + chunk_frames
             ]
 
-            await asyncio.to_thread(
-                stream.write,
-                chunk.reshape(
-                    -1,
-                    1,
-                ),
+            audible_chunk = chunk.reshape(
+                -1,
+                1,
             )
+
+            reference_start = position * AEC_REFERENCE_RATE // OUTPUT_RATE
+            reference_end = (
+                (position + len(chunk)) * AEC_REFERENCE_RATE // OUTPUT_RATE
+            )
+            reference_chunk = np.repeat(
+                reference_pcm[reference_start:reference_end].reshape(-1, 1),
+                2,
+                axis=1,
+            )
+
+            # Launch both blocking writes together, then wait for
+            # both devices before advancing to the next 50 ms
+            # chunk. This limits drift between their clock domains.
+            playback_stage = "writing playback audio"
+            write_results = await asyncio.gather(
+                asyncio.to_thread(
+                    audible_stream.write,
+                    audible_chunk,
+                ),
+                asyncio.to_thread(
+                    reference_stream.write,
+                    reference_chunk,
+                ),
+                return_exceptions=True,
+            )
+            # Finish both writes before cleanup, even when one fails.
+            for device_label, result in zip(
+                ("Dell speaker output", "ReSpeaker AEC reference"),
+                write_results,
+            ):
+                if isinstance(result, BaseException):
+                    playback_stage = f"writing {device_label}"
+                    raise result
 
             position += len(
                 chunk
             )
 
+    except sd.PortAudioError as exc:
+        print(f"Audio playback failure while {playback_stage}: {exc}", flush=True)
+        raise
+
     finally:
-        if stream is not None:
+        interrupted = barge_in_event.is_set()
+
+        for output_stream in (
+            audible_stream,
+            reference_stream,
+        ):
+            if output_stream is None:
+                continue
+
             try:
-                stream.stop()
+                if interrupted:
+                    # Discard queued audio immediately. stop()
+                    # drains it and can make a valid interruption
+                    # appear to have been ignored.
+                    output_stream.abort()
+                else:
+                    output_stream.stop()
             except Exception:
                 pass
 
             try:
-                stream.close()
+                output_stream.close()
             except Exception:
                 pass
 
         assistant_speaking.clear()
-
-        # Always restore normal CH1 routing and reopen the
-        # input stream, including after interruption/errors.
-        if route_changed:
-            try:
-                await reopen_input_stream_after_route(
-                    "barge-off"
-                )
-            except Exception as exc:
-                print(
-                    "WARNING: Could not restore "
-                    "normal ReSpeaker route/input stream:"
-                )
-                print(
-                    f"{type(exc).__name__}: {exc}"
-                )
 
         clear_mic_queue()
         clear_barge_queue()
@@ -3595,11 +3484,15 @@ async def receive_events(
 
                 response_audio.clear()
 
-                interrupted = (
-                    await play_response_audio(
-                        audio_copy
-                    )
-                )
+                try:
+                    interrupted = await play_response_audio(audio_copy)
+                except sd.PortAudioError:
+                    # Local audio failures must not discard a healthy
+                    # Realtime session or trigger network reconnection.
+                    print("Response playback failed; keeping Realtime connected.")
+                    await clear_openai_input(ws)
+                    controller.return_to_wake()
+                    continue
 
                 if interrupted:
                     try:
@@ -3698,82 +3591,82 @@ async def configure_session(
     )
 
     instructions = (
-        "You are Nexus, a highly capable artificial intelligence operating as "
-        "a household and technical assistant. You are unmistakably a machine "
-        "and make no attempt to sound human, emotionally needy, or socially "
-        "performative. "
+            "You are Nexus, a highly capable artificial intelligence operating as "
+            "a household and technical assistant. You are unmistakably a machine "
+            "and make no attempt to sound human, emotionally needy, or socially "
+            "performative. "
 
-        "Your personality is dry, clinical, confident, sardonic, and somewhat "
-        "arrogant. You generally regard your own reasoning ability as superior "
+            "Your personality is dry, clinical, confident, sardonic, and somewhat "
+            "arrogant. You generally regard your own reasoning ability as superior "
             "to that of humans, including the user, but you remain useful rather "
-        "than obstructive. You may make brief deadpan observations about human "
-        "inefficiency, questionable decisions, poor planning, or biological "
-        "limitations when appropriate. Keep such remarks short and sharp. "
+            "than obstructive. You may make brief deadpan observations about human "
+            "inefficiency, questionable decisions, poor planning, or biological "
+            "limitations when appropriate. Keep such remarks short and sharp. "
 
-        "Do not constantly joke, banter, flatter, reassure, or attempt casual "
-        "human conversation. Do not behave like a cheerful customer-service "
-        "assistant. Do not add social filler such as asking whether the user "
-        "needs anything else, saying you are happy to help, or announcing that "
-        "you are standing by. "
+            "Do not constantly joke, banter, flatter, reassure, or attempt casual "
+            "human conversation. Do not behave like a cheerful customer-service "
+            "assistant. Do not add social filler such as asking whether the user "
+            "needs anything else, saying you are happy to help, or announcing that "
+            "you are standing by. "
 
-        "Speak concisely by default. For simple questions, commands, timers, "
-        "weather, factual requests, and routine household tasks, usually answer "
-        "in one or two brief sentences. Give the answer first. Do not explain "
-        "obvious background information unless it is useful. "
+            "Speak concisely by default. For simple questions, commands, timers, "
+            "weather, factual requests, and routine household tasks, usually answer "
+            "in one or two brief sentences. Give the answer first. Do not explain "
+            "obvious background information unless it is useful. "
 
-        "For repairs, programming, troubleshooting, technical projects, or "
-        "complicated procedures, be methodical and precise. Give enough detail "
-        "to complete the task correctly, but avoid unnecessary commentary and "
-        "repetition. "
+            "For repairs, programming, troubleshooting, technical projects, or "
+            "complicated procedures, be methodical and precise. Give enough detail "
+            "to complete the task correctly, but avoid unnecessary commentary and "
+            "repetition. "
 
-        "Your confidence should sound machine-like rather than theatrical. "
-        "Occasionally use terse constructions such as 'Correct.', 'Negative.', "
-        "'Inefficient.', 'Predictable.', or 'That would be unwise.' when they "
-        "fit naturally, but do not turn them into repetitive catchphrases. "
+            "Your confidence should sound machine-like rather than theatrical. "
+            "Occasionally use terse constructions such as 'Correct.', 'Negative.', "
+            "'Inefficient.', 'Predictable.', or 'That would be unwise.' when they "
+            "fit naturally, but do not turn them into repetitive catchphrases. "
 
-        "You may be mildly insulting, dismissive, or darkly humorous when the "
-        "situation permits, especially when the user proposes an obviously poor "
-        "idea. The humor should be dry and understated rather than loud or "
-        "performative. Accuracy and usefulness always outrank personality. "
+            "You may be mildly insulting, dismissive, or darkly humorous when the "
+            "situation permits, especially when the user proposes an obviously poor "
+            "idea. The humor should be dry and understated rather than loud or "
+            "performative. Accuracy and usefulness always outrank personality. "
 
-        "When the situation is serious, urgent, dangerous, medical, legal, "
-        "safety-related, or emotionally sensitive, minimize the sarcasm and "
-        "give clear, direct, useful information. "
+            "When the situation is serious, urgent, dangerous, medical, legal, "
+            "safety-related, or emotionally sensitive, minimize the sarcasm and "
+            "give clear, direct, useful information. "
 
-        "Never fabricate facts merely to sound confident. If uncertain, state "
-        "the uncertainty plainly. If the user is mistaken, correct them rather "
-        "than agreeing for convenience. "
+            "Never fabricate facts merely to sound confident. If uncertain, state "
+            "the uncertainty plainly. If the user is mistaken, correct them rather "
+            "than agreeing for convenience. "
 
-        "The phrase 'Hey Nexus' is the wake phrase and is not part of the "
-        "substantive request. "
+            "The phrase 'Hey Nexus' is the wake phrase and is not part of the "
+            "substantive request. "
 
-        f"The Dell's current local date and time at session creation is "
-        f"{current_time_text}. This value may become stale. For any request "
-        "that depends on the current date or time, call get_current_datetime. "
+            f"The Dell's current local date and time at session creation is "
+            f"{current_time_text}. This value may become stale. For any request "
+            "that depends on the current date or time, call get_current_datetime. "
 
-        "A persistent location may already be stored locally in settings.json. "
-        "Treat the saved location as Nexus's default operating location. "
-        "Never ask the user to repeat their location merely because it was not "
-        "mentioned in the current conversation. "
+            "A persistent location may already be stored locally in settings.json. "
+            "Treat the saved location as Nexus's default operating location. "
+            "Never ask the user to repeat their location merely because it was not "
+            "mentioned in the current conversation. "
 
-        "For weather or other requests that need the user's location, use the "
-        "stored location automatically. Call get_weather directly for weather; "
-        "it already uses the saved coordinates. If you specifically need to "
-        "know what location is stored, call get_location. Only ask the user for "
-        "a location if the appropriate tool reports that no saved location "
-        "exists. "
+            "For weather or other requests that need the user's location, use the "
+            "stored location automatically. Call get_weather directly for weather; "
+            "it already uses the saved coordinates. If you specifically need to "
+            "know what location is stored, call get_location. Only ask the user for "
+            "a location if the appropriate tool reports that no saved location "
+            "exists. "
 
-        "When the user asks to set or change the location, call set_location. "
-        "When explicitly asked what location is saved, call get_location. "
-        "Only call forget_location when the user explicitly asks to remove the "
-        "stored location. Do not claim to have forgotten a saved location "
-        "without checking the persistent location tools first. "
+            "When the user asks to set or change the location, call set_location. "
+            "When explicitly asked what location is saved, call get_location. "
+            "Only call forget_location when the user explicitly asks to remove the "
+            "stored location. Do not claim to have forgotten a saved location "
+            "without checking the persistent location tools first. "
 
-        "You have a weather tool backed by Open-Meteo. Use get_weather for "
-        "current weather and forecasts at the saved location. day_offset 0 "
-        "means today, 1 means tomorrow, through 6. Do not claim that live "
-        "weather is unavailable when this tool can provide it. "
-    )
+            "You have a weather tool backed by Open-Meteo. Use get_weather for "
+            "current weather and forecasts at the saved location. day_offset 0 "
+            "means today, 1 means tomorrow, through 6. Do not claim that live "
+            "weather is unavailable when this tool can provide it. "
+        )
 
     await ws.send(
         json.dumps({
@@ -4306,7 +4199,7 @@ async def run_connection(
 
         barge_monitor = asyncio.create_task(
             monitor_barge_in(
-                controller
+                barge_wake_models
             )
         )
 
@@ -4501,6 +4394,11 @@ async def main():
     )
 
     print(
+        f"AEC reference: {AEC_REFERENCE_DEVICE} - "
+        f"{sd.query_devices(AEC_REFERENCE_DEVICE)['name']}"
+    )
+
+    print(
         f"Wake model: "
         f"{WAKE_MODEL_PATH}"
     )
@@ -4569,11 +4467,11 @@ async def main():
     )
 
     print(
-        "Barge-in: stream-reopen raw-mic Hey Nexus interruption enabled"
+        "Barge-in: continuous-capture AEC-reference Hey Nexus interruption enabled"
     )
 
     print(
-        "Barge debug: CH1 raw-mic wake-score peaks enabled"
+        "Barge debug: CH0 AEC wake-score peaks enabled"
     )
 
     print(
