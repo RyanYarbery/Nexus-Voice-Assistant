@@ -11,7 +11,8 @@ The project began as a practical replacement for a household smart speaker. Its 
 - OpenAI Realtime audio input, tool calls, and speech output
 - Conversational follow-up window after each response
 - Barge-in support with acoustic echo cancellation-aware monitoring
-- Persistent alarms, countdown timers, clock, saved location, and weather tools
+- Persistent alarms and countdown timers that survive restarts, plus clock, saved location, and weather tools
+- Say the wake phrase to silence a ringing timer or alarm
 - Automatic audio-device discovery by device name
 - Exponential reconnect backoff for transient failures
 - Immediate recovery from the Realtime API's maximum session duration
@@ -42,7 +43,7 @@ The production installation uses:
 - PipeWire/WirePlumber audio stack
 - systemd for startup and supervision
 
-Device names and all private model paths can be overridden with environment variables.
+Device names and all private model paths can be overridden with environment variables. The XVF3800's echo-cancellation reference output is optional: set `NEXUS_AEC_REFERENCE_NAME=off` for a microphone without a playback endpoint.
 
 ## Repository layout
 
@@ -63,7 +64,7 @@ Wake-word models, speaker embeddings, downloaded ML models, recordings, credenti
 
 ## Setup overview
 
-1. Install the system audio dependencies for your Linux distribution, including PortAudio.
+1. Install Python 3.9 or newer and the system audio dependencies for your Linux distribution, including PortAudio.
 2. Create a Python virtual environment and install `requirements.txt`.
 3. Place your wake-word model and enrolled speaker embeddings under `models/`, or configure their paths through environment variables.
 4. Copy `.env.example` to a private environment file and add `OPENAI_API_KEY`.
@@ -77,6 +78,7 @@ Example environment setup:
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
+pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements.txt
 export OPENAI_API_KEY="your-key-here"
 python echo.py
@@ -84,7 +86,11 @@ python echo.py
 
 ## Reliability design
 
-OpenAI Realtime sessions have a finite lifetime. Nexus treats a maximum-duration event as a connection failure and starts a new session immediately. Ordinary connection failures use capped exponential backoff.
+OpenAI Realtime sessions have a finite lifetime. Nexus treats a maximum-duration event as a connection failure and starts a new session immediately. A socket the server closes cleanly is detected the same way, so Nexus never idles on a dead connection. Ordinary connection failures use capped exponential backoff.
+
+After speaker verification, microphone audio streams to the Realtime API only until server-side voice activity detection reports speech. If no speech is detected within ten seconds, Nexus stops uploading and returns to wake-word listening.
+
+Alarms and timers are written to `alarms.json` and `timers.json` as they change, so a restart restores them. A timer that came due while Nexus was down still rings if it is less than ten minutes late.
 
 Some long-running audio and ML workloads can enter a degraded state where new WebSocket handshakes continue timing out even though ordinary HTTPS remains healthy. After three consecutive opening-handshake timeouts, Nexus exits immediately. The accompanying systemd policy then replaces the complete process group, reinitializing the audio, wake-word, speaker-recognition, DNS, TLS, and WebSocket state.
 
@@ -92,7 +98,7 @@ Some long-running audio and ML workloads can enter a degraded state where new We
 
 - The API key is read from `OPENAI_API_KEY`; it is not hard-coded.
 - Speaker embeddings are biometric data and must not be committed.
-- Saved locations and alarm data remain local and are ignored by Git.
+- Saved locations, alarm data, and timer data remain local and are ignored by Git.
 - Tool logs redact sensitive arguments where appropriate.
 - `.gitignore` blocks the common model, recording, credential, state, and backup formats used by the production installation.
 
@@ -110,8 +116,10 @@ Nexus is deployed as an always-on household assistant. Wake detection, speaker v
 ## Future improvements
 
 - Split the single-file prototype into testable modules
-- Add unit tests for alarm persistence and connection-state transitions
+- Add unit tests for alarm and timer persistence and connection-state transitions
+- Add a LICENSE file
 - Package hardware-specific ReSpeaker routing separately
+- Stream response audio as it arrives instead of buffering the whole reply
 - Add structured logging and health metrics
 - Provide a guided speaker-enrollment utility
 

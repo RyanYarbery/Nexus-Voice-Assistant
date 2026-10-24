@@ -4,6 +4,7 @@ env
 *.env
 settings.json
 alarms.json
+timers.json
 
 # Biometric profiles, wake models, and downloaded ML models
 models/

@@ -5,6 +5,7 @@ os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"
 import asyncio
 import base64
 import json
+import math
 import queue
 import subprocess
 import threading
@@ -26,6 +27,11 @@ import numpy as np
 import sounddevice as sd
 import torch
 import websockets
+
+try:
+    from scipy.signal import resample_poly
+except Exception:  # pragma: no cover - scipy is normally present
+    resample_poly = None
 
 from openwakeword.model import Model as WakeWordModel
 from speechbrain.inference.speaker import SpeakerRecognition
@@ -97,6 +103,26 @@ SETTINGS_FILE = Path(
     )
 )
 
+TIMERS_FILE = Path(
+    os.environ.get(
+        "NEXUS_TIMERS_FILE",
+        str(BASE_DIR / "timers.json"),
+    )
+)
+
+# A restored timer that expired while Nexus was down still rings if
+# it is no later than this; older ones are silently discarded.
+TIMER_LATE_GRACE_SECONDS = 600
+
+# Output device used as the XVF3800 far-end echo-cancellation
+# reference. Defaults to the microphone's own playback endpoint.
+# Set to "off" for microphones without one; barge-in then relies on
+# the raw wake-word score alone.
+AEC_REFERENCE_NAME = os.environ.get(
+    "NEXUS_AEC_REFERENCE_NAME",
+    MIC_NAME,
+)
+
 NOMINATIM_SEARCH_URL = (
     "https://nominatim.openstreetmap.org/search"
 )
@@ -127,6 +153,11 @@ FOLLOWUP_SECONDS = 5.0
 FOLLOWUP_VERIFY_SECONDS = 2.2
 FOLLOWUP_OVERLAP_SECONDS = 0.6
 
+# After speaker verification, microphone audio streams to OpenAI
+# until server VAD reports speech. If no speech is ever detected,
+# stop streaming and return to wake instead of uploading indefinitely.
+ACTIVE_SPEECH_TIMEOUT_SECONDS = 10.0
+
 # =========================================================
 # HEY NEXUS BARGE-IN
 # =========================================================
@@ -141,7 +172,22 @@ FOLLOWUP_OVERLAP_SECONDS = 0.6
 
 BARGE_WAKE_THRESHOLD = 0.30
 
-BARGE_DEBUG = True
+def env_flag(name, default=False):
+    value = os.environ.get(name)
+
+    if value is None:
+        return default
+
+    return value.strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+# Per-block score logging is useful while tuning thresholds but
+# floods journald in normal operation. Enable with NEXUS_BARGE_DEBUG=1
+# and NEXUS_WAKE_DEBUG=1.
+BARGE_DEBUG = env_flag("NEXUS_BARGE_DEBUG")
+WAKE_DEBUG = env_flag("NEXUS_WAKE_DEBUG")
 BARGE_DEBUG_INTERVAL_SECONDS = 0.50
 
 RESPEAKER_ROUTE_HELPER = os.environ.get(
@@ -203,6 +249,21 @@ next_alarm_id = 1
 settings_lock = threading.Lock()
 last_nominatim_request = 0.0
 
+# Serialises every use of the speaker: response playback, timer
+# beeps, and alarm beeps. Without it an alarm firing mid-response
+# opened a second stream on the same device and cleared
+# assistant_speaking while Nexus was still talking.
+_playback_lock = None
+
+
+def playback_lock():
+    global _playback_lock
+
+    if _playback_lock is None:
+        _playback_lock = asyncio.Lock()
+
+    return _playback_lock
+
 
 # =========================================================
 # DEVICE DISCOVERY
@@ -250,10 +311,25 @@ OUTPUT_DEVICE = find_device(
     need_output=True,
 )
 
-AEC_REFERENCE_DEVICE = find_device(
-    MIC_NAME,
-    need_output=True,
-)
+if AEC_REFERENCE_NAME.strip().lower() in (
+    "",
+    "off",
+    "none",
+    "disabled",
+):
+    AEC_REFERENCE_DEVICE = None
+else:
+    try:
+        AEC_REFERENCE_DEVICE = find_device(
+            AEC_REFERENCE_NAME,
+            need_output=True,
+        )
+    except RuntimeError as exc:
+        print(
+            f"WARNING: {exc}; continuing without "
+            "an AEC reference output."
+        )
+        AEC_REFERENCE_DEVICE = None
 
 
 # =========================================================
@@ -270,6 +346,22 @@ def resample_int16(
 
     if len(audio) == 0:
         return audio
+
+    if resample_poly is not None:
+        # Polyphase FIR resampling. Linear interpolation has no
+        # anti-aliasing filter, which matters most for the 48 kHz
+        # to 16 kHz AEC reference and the 16 kHz to 24 kHz uplink.
+        divisor = math.gcd(old_rate, new_rate)
+        result = resample_poly(
+            audio.astype(np.float32),
+            new_rate // divisor,
+            old_rate // divisor,
+        )
+        return np.clip(
+            np.rint(result),
+            -32768,
+            32767,
+        ).astype(np.int16)
 
     new_length = int(
         len(audio)
@@ -336,6 +428,21 @@ def blocks_have_seconds(
         samples_in_blocks(blocks)
         >= needed
     )
+
+
+async def queue_get(target_queue):
+    # A worker thread blocked on an unbounded queue.get() outlives the
+    # asyncio task that was cancelled around it, then swallows the
+    # next block. Polling with a short timeout bounds that leak.
+    while True:
+        try:
+            return await asyncio.to_thread(
+                target_queue.get,
+                True,
+                0.5,
+            )
+        except queue.Empty:
+            continue
 
 
 def clear_mic_queue():
@@ -506,11 +613,19 @@ def load_voice_system():
     )
 
     def load_profile(path):
-        saved = torch.load(
-            path,
-            map_location="cpu",
-            weights_only=False,
-        )
+        try:
+            saved = torch.load(
+                path,
+                map_location="cpu",
+                weights_only=True,
+            )
+        except Exception:
+            # Older profiles may contain pickled non-tensor objects.
+            saved = torch.load(
+                path,
+                map_location="cpu",
+                weights_only=False,
+            )
 
         if isinstance(saved, dict):
             saved = saved["embedding"]
@@ -656,6 +771,67 @@ def format_duration(seconds):
     return " ".join(parts)
 
 
+async def play_beeps(
+    frequency,
+    beep_seconds,
+    gap_seconds,
+    count,
+    volume,
+):
+    t = np.arange(
+        int(
+            OUTPUT_RATE
+            * beep_seconds
+        ),
+        dtype=np.float32,
+    ) / OUTPUT_RATE
+
+    tone = (
+        np.sin(
+            2
+            * np.pi
+            * frequency
+            * t
+        )
+        * volume
+        * 32767
+    ).astype(np.int16)
+
+    async with playback_lock():
+        # Hold assistant_speaking for the whole ring so microphone
+        # audio keeps flowing to the barge-in monitor, which lets
+        # "Hey Nexus" silence the beeps.
+        barge_in_event.clear()
+        clear_barge_queue()
+        assistant_speaking.set()
+
+        try:
+            for _ in range(count):
+                if barge_in_event.is_set():
+                    print(
+                        "Beeps silenced by wake phrase."
+                    )
+                    break
+
+                await asyncio.to_thread(
+                    sd.play,
+                    tone,
+                    OUTPUT_RATE,
+                    device=OUTPUT_DEVICE,
+                    blocking=True,
+                )
+
+                await asyncio.sleep(
+                    gap_seconds
+                )
+
+        finally:
+            assistant_speaking.clear()
+            barge_in_event.clear()
+            clear_mic_queue()
+            clear_barge_queue()
+
+
 async def play_timer_alarm(
     timer_id,
     label,
@@ -674,51 +850,198 @@ async def play_timer_alarm(
         "================================="
     )
 
-    t = np.arange(
-        int(
-            OUTPUT_RATE
-            * TIMER_BEEP_SECONDS
-        ),
-        dtype=np.float32,
-    ) / OUTPUT_RATE
-
-    tone = (
-        np.sin(
-            2
-            * np.pi
-            * TIMER_TONE_FREQUENCY
-            * t
-        )
-        * TIMER_VOLUME
+    await play_beeps(
+        TIMER_TONE_FREQUENCY,
+        TIMER_BEEP_SECONDS,
+        TIMER_BEEP_GAP,
+        TIMER_BEEP_COUNT,
+        TIMER_VOLUME,
     )
 
-    tone = (
-        tone
-        * 32767
-    ).astype(np.int16)
 
-    for _ in range(
-        TIMER_BEEP_COUNT
+def save_timers():
+    data = []
+
+    for timer_id in sorted(
+        timers.keys()
     ):
-        assistant_speaking.set()
+        timer = timers[
+            timer_id
+        ]
 
-        try:
-            await asyncio.to_thread(
-                sd.play,
-                tone,
-                OUTPUT_RATE,
-                device=OUTPUT_DEVICE,
-                blocking=True,
+        data.append({
+            "timer_id":
+                timer_id,
+
+            "label":
+                timer["label"],
+
+            "duration_seconds":
+                timer["duration_seconds"],
+
+            "due_at":
+                timer["due_at"].isoformat(),
+        })
+
+    temporary = (
+        TIMERS_FILE.with_suffix(
+            ".json.tmp"
+        )
+    )
+
+    temporary.write_text(
+        json.dumps(
+            data,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    os.replace(
+        temporary,
+        TIMERS_FILE,
+    )
+
+
+def register_timer(
+    timer_id,
+    label,
+    duration_seconds,
+    remaining_seconds,
+):
+    now = (
+        datetime.now()
+        .astimezone()
+    )
+
+    timers[timer_id] = {
+        "id":
+            timer_id,
+
+        "label":
+            str(label),
+
+        "duration_seconds":
+            duration_seconds,
+
+        "due_monotonic":
+            time.monotonic()
+            + remaining_seconds,
+
+        "due_at":
+            now
+            + timedelta(
+                seconds=remaining_seconds
+            ),
+
+        "task":
+            asyncio.create_task(
+                timer_worker(
+                    timer_id,
+                    remaining_seconds,
+                )
+            ),
+    }
+
+    save_timers()
+
+
+async def restore_timers():
+    global next_timer_id
+
+    if not TIMERS_FILE.exists():
+        save_timers()
+        return
+
+    try:
+        saved = json.loads(
+            TIMERS_FILE.read_text(
+                encoding="utf-8"
             )
-
-        finally:
-            assistant_speaking.clear()
-
-        await asyncio.sleep(
-            TIMER_BEEP_GAP
         )
 
-    clear_mic_queue()
+    except Exception as exc:
+        print(
+            "Could not load saved timers:"
+        )
+        print(
+            f"{type(exc).__name__}: {exc}"
+        )
+        return
+
+    now = (
+        datetime.now()
+        .astimezone()
+    )
+
+    highest_id = 0
+
+    for entry in saved:
+        try:
+            timer_id = int(
+                entry["timer_id"]
+            )
+
+            due_at = parse_alarm_datetime(
+                entry["due_at"]
+            )
+
+            label = str(
+                entry.get(
+                    "label",
+                    "Timer",
+                )
+            )
+
+            duration_seconds = float(
+                entry.get(
+                    "duration_seconds",
+                    0,
+                )
+            )
+
+        except Exception:
+            continue
+
+        highest_id = max(
+            highest_id,
+            timer_id,
+        )
+
+        remaining = (
+            due_at.timestamp()
+            - now.timestamp()
+        )
+
+        if remaining < -TIMER_LATE_GRACE_SECONDS:
+            print(
+                "Discarding stale timer "
+                f"#{timer_id}: {label}"
+            )
+            continue
+
+        register_timer(
+            timer_id,
+            label,
+            duration_seconds,
+            max(
+                0.0,
+                remaining,
+            ),
+        )
+
+        print(
+            f"Restored timer #{timer_id}: "
+            f"{label} - "
+            f"{format_duration(max(0.0, remaining))} remaining"
+        )
+
+    next_timer_id = max(
+        highest_id + 1,
+        next_timer_id,
+    )
+
+    save_timers()
 
 
 async def timer_worker(
@@ -743,6 +1066,8 @@ async def timer_worker(
             timer_id,
             None,
         )
+
+        save_timers()
 
         await play_timer_alarm(
             timer_id,
@@ -791,34 +1116,12 @@ async def set_local_timer(
     if not label:
         label = "Timer"
 
-    due_monotonic = (
-        time.monotonic()
-        + duration_seconds
+    register_timer(
+        timer_id,
+        label,
+        duration_seconds,
+        duration_seconds,
     )
-
-    task = asyncio.create_task(
-        timer_worker(
-            timer_id,
-            duration_seconds,
-        )
-    )
-
-    timers[timer_id] = {
-        "id":
-            timer_id,
-
-        "label":
-            str(label),
-
-        "duration_seconds":
-            duration_seconds,
-
-        "due_monotonic":
-            due_monotonic,
-
-        "task":
-            task,
-    }
 
     print(
         f"Timer #{timer_id} set: "
@@ -951,6 +1254,8 @@ async def cancel_local_timer(
 
     timer["task"].cancel()
 
+    save_timers()
+
     print(
         f"Timer #{selected_id} cancelled: "
         f"{timer['label']}"
@@ -1072,51 +1377,13 @@ async def play_alarm_sound(
         "================================="
     )
 
-    t = np.arange(
-        int(
-            OUTPUT_RATE
-            * ALARM_BEEP_SECONDS
-        ),
-        dtype=np.float32,
-    ) / OUTPUT_RATE
-
-    tone = (
-        np.sin(
-            2
-            * np.pi
-            * ALARM_TONE_FREQUENCY
-            * t
-        )
-        * ALARM_VOLUME
+    await play_beeps(
+        ALARM_TONE_FREQUENCY,
+        ALARM_BEEP_SECONDS,
+        ALARM_BEEP_GAP,
+        ALARM_BEEP_COUNT,
+        ALARM_VOLUME,
     )
-
-    tone = (
-        tone
-        * 32767
-    ).astype(np.int16)
-
-    for _ in range(
-        ALARM_BEEP_COUNT
-    ):
-        assistant_speaking.set()
-
-        try:
-            await asyncio.to_thread(
-                sd.play,
-                tone,
-                OUTPUT_RATE,
-                device=OUTPUT_DEVICE,
-                blocking=True,
-            )
-
-        finally:
-            assistant_speaking.clear()
-
-        await asyncio.sleep(
-            ALARM_BEEP_GAP
-        )
-
-    clear_mic_queue()
 
 
 async def alarm_worker(
@@ -2426,8 +2693,6 @@ def reset_wake_detectors(
 async def monitor_barge_in(
     barge_wake_models,
 ):
-    loop = asyncio.get_running_loop()
-
     reset_wake_detectors(
         barge_wake_models
     )
@@ -2437,9 +2702,8 @@ async def monitor_barge_in(
     last_print = time.monotonic()
 
     while True:
-        block = await loop.run_in_executor(
-            None,
-            barge_queue.get,
+        block = await queue_get(
+            barge_queue
         )
 
         if not assistant_speaking.is_set():
@@ -2648,149 +2912,178 @@ async def play_response_audio(
         OUTPUT_RATE,
     )
 
+    use_reference = AEC_REFERENCE_DEVICE is not None
+
     # Resample the complete reference once; never restart resampling at
     # chunk boundaries. The two devices consume different frame counts
     # for the same amount of real time.
-    reference_pcm = resample_int16(
-        pcm_48k, OUTPUT_RATE, AEC_REFERENCE_RATE,
+    reference_pcm = (
+        resample_int16(
+            pcm_24k, MODEL_RATE, AEC_REFERENCE_RATE,
+        )
+        if use_reference
+        else None
     )
 
-    barge_in_event.clear()
-    clear_barge_queue()
-    clear_mic_queue()
-
-    audible_stream = None
-    reference_stream = None
-    playback_stage = "opening Dell speaker output (48000 Hz, mono)"
-
-    try:
-        # Keep the microphone stream open continuously. The
-        # XVF3800 AEC-residual route is established once during
-        # startup, so closing and reopening PortAudio here adds no
-        # routing benefit and can hang inside ALSA stream.start().
-        assistant_speaking.set()
-
-        chunk_frames = int(
-            OUTPUT_RATE * 0.05
-        )
-
-        audible_stream = sd.OutputStream(
-            samplerate=OUTPUT_RATE,
-            device=OUTPUT_DEVICE,
-            channels=1,
-            dtype="int16",
-            blocksize=chunk_frames,
-        )
-
-        # The ReSpeaker analog jack remains disconnected. This
-        # second stream supplies only the digital far-end signal
-        # required by the XVF3800's hardware echo canceller.
-        playback_stage = "opening ReSpeaker AEC reference (16000 Hz, stereo)"
-        reference_stream = sd.OutputStream(
-            samplerate=AEC_REFERENCE_RATE,
-            device=AEC_REFERENCE_DEVICE,
-            channels=2,
-            dtype="int16",
-            blocksize=int(AEC_REFERENCE_RATE * 0.05),
-        )
-
-        # Start the reference first. Separate USB/Dell clocks and driver
-        # buffering still require a physical echo-cancellation test.
-        playback_stage = "starting ReSpeaker AEC reference"
-        reference_stream.start()
-        playback_stage = "starting Dell speaker output"
-        audible_stream.start()
-
-        position = 0
-
-        while position < len(
-            pcm_48k
-        ):
-            if barge_in_event.is_set():
-                break
-
-            chunk = pcm_48k[
-                position:
-                position + chunk_frames
-            ]
-
-            audible_chunk = chunk.reshape(
-                -1,
-                1,
-            )
-
-            reference_start = position * AEC_REFERENCE_RATE // OUTPUT_RATE
-            reference_end = (
-                (position + len(chunk)) * AEC_REFERENCE_RATE // OUTPUT_RATE
-            )
-            reference_chunk = np.repeat(
-                reference_pcm[reference_start:reference_end].reshape(-1, 1),
-                2,
-                axis=1,
-            )
-
-            # Launch both blocking writes together, then wait for
-            # both devices before advancing to the next 50 ms
-            # chunk. This limits drift between their clock domains.
-            playback_stage = "writing playback audio"
-            write_results = await asyncio.gather(
-                asyncio.to_thread(
-                    audible_stream.write,
-                    audible_chunk,
-                ),
-                asyncio.to_thread(
-                    reference_stream.write,
-                    reference_chunk,
-                ),
-                return_exceptions=True,
-            )
-            # Finish both writes before cleanup, even when one fails.
-            for device_label, result in zip(
-                ("Dell speaker output", "ReSpeaker AEC reference"),
-                write_results,
-            ):
-                if isinstance(result, BaseException):
-                    playback_stage = f"writing {device_label}"
-                    raise result
-
-            position += len(
-                chunk
-            )
-
-    except sd.PortAudioError as exc:
-        print(f"Audio playback failure while {playback_stage}: {exc}", flush=True)
-        raise
-
-    finally:
-        interrupted = barge_in_event.is_set()
-
-        for output_stream in (
-            audible_stream,
-            reference_stream,
-        ):
-            if output_stream is None:
-                continue
-
-            try:
-                if interrupted:
-                    # Discard queued audio immediately. stop()
-                    # drains it and can make a valid interruption
-                    # appear to have been ignored.
-                    output_stream.abort()
-                else:
-                    output_stream.stop()
-            except Exception:
-                pass
-
-            try:
-                output_stream.close()
-            except Exception:
-                pass
-
-        assistant_speaking.clear()
-
-        clear_mic_queue()
+    async with playback_lock():
+        barge_in_event.clear()
         clear_barge_queue()
+        clear_mic_queue()
+
+        audible_stream = None
+        reference_stream = None
+        playback_stage = "opening speaker output (48000 Hz, mono)"
+
+        try:
+            # Keep the microphone stream open continuously. The
+            # XVF3800 AEC-residual route is established once during
+            # startup, so closing and reopening PortAudio here adds no
+            # routing benefit and can hang inside ALSA stream.start().
+            assistant_speaking.set()
+
+            chunk_frames = int(
+                OUTPUT_RATE * 0.05
+            )
+
+            audible_stream = sd.OutputStream(
+                samplerate=OUTPUT_RATE,
+                device=OUTPUT_DEVICE,
+                channels=1,
+                dtype="int16",
+                blocksize=chunk_frames,
+            )
+
+            if use_reference:
+                # The ReSpeaker analog jack remains disconnected. This
+                # second stream supplies only the digital far-end signal
+                # required by the XVF3800's hardware echo canceller.
+                playback_stage = "opening AEC reference (16000 Hz, stereo)"
+                reference_stream = sd.OutputStream(
+                    samplerate=AEC_REFERENCE_RATE,
+                    device=AEC_REFERENCE_DEVICE,
+                    channels=2,
+                    dtype="int16",
+                    blocksize=int(AEC_REFERENCE_RATE * 0.05),
+                )
+
+                # Start the reference first. Separate USB/Dell clocks and
+                # driver buffering still require a physical test.
+                playback_stage = "starting AEC reference"
+                reference_stream.start()
+
+            playback_stage = "starting speaker output"
+            audible_stream.start()
+
+            position = 0
+
+            while position < len(
+                pcm_48k
+            ):
+                if barge_in_event.is_set():
+                    break
+
+                chunk = pcm_48k[
+                    position:
+                    position + chunk_frames
+                ]
+
+                audible_chunk = chunk.reshape(
+                    -1,
+                    1,
+                )
+
+                writes = [
+                    asyncio.to_thread(
+                        audible_stream.write,
+                        audible_chunk,
+                    ),
+                ]
+                labels = ["speaker output"]
+
+                if use_reference:
+                    reference_start = (
+                        position * AEC_REFERENCE_RATE // OUTPUT_RATE
+                    )
+                    reference_end = (
+                        (position + len(chunk))
+                        * AEC_REFERENCE_RATE
+                        // OUTPUT_RATE
+                    )
+                    reference_chunk = np.repeat(
+                        reference_pcm[
+                            reference_start:reference_end
+                        ].reshape(-1, 1),
+                        2,
+                        axis=1,
+                    )
+
+                    writes.append(
+                        asyncio.to_thread(
+                            reference_stream.write,
+                            reference_chunk,
+                        )
+                    )
+                    labels.append("AEC reference")
+
+                # Launch the blocking writes together, then wait for
+                # every device before advancing to the next 50 ms
+                # chunk. This limits drift between their clock domains.
+                playback_stage = "writing playback audio"
+                write_results = await asyncio.gather(
+                    *writes,
+                    return_exceptions=True,
+                )
+
+                # Finish all writes before cleanup, even when one fails.
+                for device_label, result in zip(
+                    labels,
+                    write_results,
+                ):
+                    if isinstance(result, BaseException):
+                        playback_stage = f"writing {device_label}"
+                        raise result
+
+                position += len(
+                    chunk
+                )
+
+        except sd.PortAudioError as exc:
+            print(
+                f"Audio playback failure while {playback_stage}: {exc}",
+                flush=True,
+            )
+            raise
+
+        finally:
+            interrupted = barge_in_event.is_set()
+
+            for output_stream in (
+                audible_stream,
+                reference_stream,
+            ):
+                if output_stream is None:
+                    continue
+
+                try:
+                    if interrupted:
+                        # Discard queued audio immediately. stop()
+                        # drains it and can make a valid interruption
+                        # appear to have been ignored.
+                        output_stream.abort()
+                    else:
+                        output_stream.stop()
+                except Exception:
+                    pass
+
+                try:
+                    output_stream.close()
+                except Exception:
+                    pass
+
+            assistant_speaking.clear()
+
+            clear_mic_queue()
+            clear_barge_queue()
 
     interrupted = (
         barge_in_event.is_set()
@@ -2840,9 +3133,25 @@ class NexusController:
 
         self.active_channel = 0
         self.followup_deadline = 0.0
+        self.active_deadline = 0.0
         self.wake_cooldown_until = 0.0
         self.response_active = False
         self.speech_started_seen = False
+
+
+    def enter_active(
+        self,
+        channel,
+    ):
+        self.active_channel = channel
+        self.speech_started_seen = False
+        self.active_deadline = (
+            time.monotonic()
+            + ACTIVE_SPEECH_TIMEOUT_SECONDS
+        )
+        self.state = (
+            AssistantState.ACTIVE
+        )
 
 
     def start_followup(
@@ -2893,6 +3202,7 @@ class NexusController:
         self.response_active = False
         self.speech_started_seen = False
         self.followup_deadline = 0.0
+        self.active_deadline = 0.0
         self.wake_cooldown_until = 0.0
         self.active_channel = 0
 
@@ -2942,13 +3252,11 @@ async def process_microphone(
     wake_models,
     controller,
 ):
-    loop = asyncio.get_running_loop()
     wake_model_ch0, wake_model_ch1 = wake_models
 
     while True:
-        block = await loop.run_in_executor(
-            None,
-            mic_queue.get,
+        block = await queue_get(
+            mic_queue
         )
 
         if assistant_speaking.is_set():
@@ -2985,7 +3293,7 @@ async def process_microphone(
                 score1,
             )
 
-            if best_score >= 0.02:
+            if WAKE_DEBUG and best_score >= 0.02:
                 print(
                     f"WAKE DEBUG CH0={score0:.3f} "
                     f"CH1={score1:.3f} "
@@ -3091,7 +3399,6 @@ async def process_microphone(
                 )
                 continue
 
-            controller.active_channel = winner
             print(
                 "Speaker accepted."
             )
@@ -3102,8 +3409,8 @@ async def process_microphone(
                 "Listening for request..."
             )
 
-            controller.state = (
-                AssistantState.ACTIVE
+            controller.enter_active(
+                winner
             )
 
             await clear_openai_input(
@@ -3124,6 +3431,27 @@ async def process_microphone(
             controller.state
             == AssistantState.ACTIVE
         ):
+            if (
+                not controller.speech_started_seen
+                and
+                time.monotonic()
+                >= controller.active_deadline
+            ):
+                print(
+                    "No speech detected; "
+                    "stopping microphone upload."
+                )
+
+                try:
+                    await clear_openai_input(
+                        ws
+                    )
+                except Exception:
+                    pass
+
+                controller.return_to_wake()
+                continue
+
             await send_pcm_to_openai(
                 ws,
                 block[controller.active_channel],
@@ -3205,7 +3533,6 @@ async def process_microphone(
             )
 
             if best_similarity >= SPEAKER_THRESHOLD:
-                controller.active_channel = winner
                 print(
                     "Follow-up speaker accepted."
                 )
@@ -3213,10 +3540,9 @@ async def process_microphone(
                     f"Using microphone channel {winner}."
                 )
 
-                controller.state = (
-                    AssistantState.ACTIVE
+                controller.enter_active(
+                    winner
                 )
-                controller.speech_started_seen = False
 
                 await clear_openai_input(
                     ws
@@ -4138,15 +4464,6 @@ async def configure_session(
 # ONE REALTIME CONNECTION
 # =========================================================
 
-async def realtime_session_rotation_monitor(
-    controller,
-):
-    # Do not deliberately close a healthy connection. OpenAI's
-    # maximum-duration error is handled by receive_events(), which
-    # raises ConnectionError and lets connection_manager reconnect.
-    await asyncio.Future()
-
-
 async def run_connection(
     api_key,
     wake_models,
@@ -4203,23 +4520,23 @@ async def run_connection(
             )
         )
 
-        rotation_monitor = asyncio.create_task(
-            realtime_session_rotation_monitor(
-                controller,
-            )
-        )
+        tasks = [
+            processor,
+            receiver,
+            barge_monitor,
+        ]
 
         try:
+            # FIRST_COMPLETED, not FIRST_EXCEPTION: when the server
+            # closes the socket cleanly, receive_events() returns
+            # without raising. Waiting only for exceptions would leave
+            # Nexus idle on a dead connection until the next wake-word
+            # attempt tried to send and failed.
             done, pending = (
                 await asyncio.wait(
-                    [
-                        processor,
-                        receiver,
-                        barge_monitor,
-                        rotation_monitor,
-                    ],
+                    tasks,
                     return_when=(
-                        asyncio.FIRST_EXCEPTION
+                        asyncio.FIRST_COMPLETED
                     ),
                 )
             )
@@ -4230,17 +4547,15 @@ async def run_connection(
                 if exc is not None:
                     raise exc
 
+            # Only the receiver can finish without an exception, and
+            # that means the Realtime socket was closed by the server.
+
         finally:
-            processor.cancel()
-            receiver.cancel()
-            barge_monitor.cancel()
-            rotation_monitor.cancel()
+            for task in tasks:
+                task.cancel()
 
             await asyncio.gather(
-                processor,
-                receiver,
-                barge_monitor,
-                rotation_monitor,
+                *tasks,
                 return_exceptions=True,
             )
 
@@ -4284,6 +4599,15 @@ async def connection_manager(
             )
 
             consecutive_handshake_failures = 0
+
+            if (
+                time.monotonic()
+                - connection_started
+                >= 30
+            ):
+                delay = (
+                    RECONNECT_INITIAL_SECONDS
+                )
 
         except asyncio.CancelledError:
             raise
@@ -4393,10 +4717,15 @@ async def main():
         f"{sd.query_devices(OUTPUT_DEVICE)['name']}"
     )
 
-    print(
-        f"AEC reference: {AEC_REFERENCE_DEVICE} - "
-        f"{sd.query_devices(AEC_REFERENCE_DEVICE)['name']}"
-    )
+    if AEC_REFERENCE_DEVICE is None:
+        print(
+            "AEC reference: disabled"
+        )
+    else:
+        print(
+            f"AEC reference: {AEC_REFERENCE_DEVICE} - "
+            f"{sd.query_devices(AEC_REFERENCE_DEVICE)['name']}"
+        )
 
     print(
         f"Wake model: "
@@ -4439,6 +4768,10 @@ async def main():
     )
 
     print(
+        f"Timer file: {TIMERS_FILE}"
+    )
+
+    print(
         f"Settings file: {SETTINGS_FILE}"
     )
 
@@ -4471,7 +4804,8 @@ async def main():
     )
 
     print(
-        "Barge debug: CH0 AEC wake-score peaks enabled"
+        "Barge debug: "
+        f"{'enabled' if BARGE_DEBUG else 'disabled (NEXUS_BARGE_DEBUG=1)'}"
     )
 
     print(
@@ -4481,29 +4815,32 @@ async def main():
 
     print()
 
-    print(
-        "Restoring normal ReSpeaker route..."
-    )
+    if Path(RESPEAKER_ROUTE_HELPER).exists():
+        print(
+            "Restoring normal ReSpeaker route..."
+        )
 
-    try:
-        route_status = (
+        try:
             await set_respeaker_route_async(
                 "barge-off"
             )
-        )
 
-        print(
-            "ReSpeaker normal route restored."
-        )
+            print(
+                "ReSpeaker normal route restored."
+            )
 
-    except Exception as exc:
-        print(
-            "WARNING: Could not restore "
-            "normal ReSpeaker route at startup:"
-        )
+        except Exception as exc:
+            print(
+                "WARNING: Could not restore "
+                "normal ReSpeaker route at startup:"
+            )
 
+            print(
+                f"{type(exc).__name__}: {exc}"
+            )
+    else:
         print(
-            f"{type(exc).__name__}: {exc}"
+            "ReSpeaker route helper not installed; skipping."
         )
 
     print()
@@ -4562,6 +4899,14 @@ async def main():
         print(
             f"{len(alarms)} saved alarm"
             f"{'' if len(alarms) == 1 else 's'} loaded."
+        )
+
+    await restore_timers()
+
+    if timers:
+        print(
+            f"{len(timers)} saved timer"
+            f"{'' if len(timers) == 1 else 's'} loaded."
         )
 
     await asyncio.to_thread(

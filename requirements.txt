@@ -1,5 +1,9 @@
+# On Linux a bare "torch" install pulls the multi-gigabyte CUDA build.
+# Nexus runs inference on the CPU; install the CPU wheel first:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
 numpy
 openwakeword
+scipy
 sounddevice
 speechbrain
 torch
