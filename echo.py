@@ -190,6 +190,63 @@ BARGE_DEBUG = env_flag("NEXUS_BARGE_DEBUG")
 WAKE_DEBUG = env_flag("NEXUS_WAKE_DEBUG")
 BARGE_DEBUG_INTERVAL_SECONDS = 0.50
 
+# =========================================================
+# PLAYBACK
+# =========================================================
+#
+# Streaming playback starts the loudspeaker as soon as the first
+# audio arrives instead of waiting for the whole reply, and sends
+# response.cancel to the server on barge-in. NEXUS_STREAMING_PLAYBACK=0
+# restores the original buffered behaviour.
+
+STREAMING_PLAYBACK = env_flag("NEXUS_STREAMING_PLAYBACK", True)
+PLAYBACK_PREBUFFER_SECONDS = 0.3
+
+# The XVF3800 locks its master clock to the host playback stream and
+# free-runs when none is open. Keeping one reference stream open for
+# the life of the process (writing silence between replies) avoids a
+# clock re-lock and AEC re-convergence at the start of every reply.
+AEC_REFERENCE_CONTINUOUS = env_flag("NEXUS_AEC_REFERENCE_CONTINUOUS", True)
+
+# =========================================================
+# SPEAKER VERIFICATION
+# =========================================================
+#
+#   soft   - stream to OpenAI the moment the wake word fires and
+#            verify the speaker in parallel over the first seconds of
+#            the request; cancel if the speaker is rejected. (default)
+#   strict - original behaviour: hold the request until 1.2 s of audio
+#            has been verified before any audio leaves the machine.
+#   off    - no speaker verification.
+
+SPEAKER_VERIFY_MODE = os.environ.get(
+    "NEXUS_SPEAKER_VERIFY_MODE",
+    "soft",
+).strip().lower()
+
+if SPEAKER_VERIFY_MODE not in ("soft", "strict", "off"):
+    print(
+        f"WARNING: unknown NEXUS_SPEAKER_VERIFY_MODE "
+        f"{SPEAKER_VERIFY_MODE!r}; using 'soft'."
+    )
+    SPEAKER_VERIFY_MODE = "soft"
+
+# Soft mode judges the speaker on up to this much audio (wake-word
+# pre-roll included), or on whatever has arrived when speech stops.
+SOFT_VERIFY_SECONDS = 2.5
+
+# Microphone audio kept while waiting for a reply so that speech
+# captured right after a barge-in is not lost.
+WAIT_BLOCKS_MAX = max(
+    1,
+    int(1.6 * INPUT_RATE / INPUT_BLOCK_FRAMES),
+)
+
+RECENT_BLOCKS_MAX = max(
+    1,
+    int(0.8 * INPUT_RATE / INPUT_BLOCK_FRAMES),
+)
+
 RESPEAKER_ROUTE_HELPER = os.environ.get(
     "NEXUS_RESPEAKER_ROUTE_HELPER",
     "/usr/local/bin/nexus-respeaker-route",
@@ -393,6 +450,73 @@ def resample_int16(
     ).astype(np.int16)
 
 
+class StreamResampler:
+    """Stateful polyphase resampler for a stream of int16 chunks.
+
+    Resampling each network delta independently would leave a filter
+    transient at every chunk boundary and click audibly. This keeps the
+    filter state and decimation phase between calls, so chunked output
+    is identical to resampling the whole signal at once.
+    """
+
+    def __init__(self, old_rate, new_rate):
+        divisor = math.gcd(old_rate, new_rate)
+        self.up = new_rate // divisor
+        self.down = old_rate // divisor
+        self.identity = self.up == 1 and self.down == 1
+
+        if self.identity:
+            return
+
+        half_len = 10 * max(self.up, self.down)
+        taps = 2 * half_len + 1
+
+        # Low-pass at the lower of the two Nyquist frequencies,
+        # expressed as a fraction of the zero-stuffed signal's Nyquist.
+        cutoff = 1.0 / max(self.up, self.down)
+        n = np.arange(taps) - half_len
+        kernel = cutoff * np.sinc(cutoff * n) * np.kaiser(taps, 5.0)
+        kernel = kernel / kernel.sum() * self.up
+
+        self.kernel = kernel.astype(np.float32)
+        self.state = np.zeros(taps - 1, dtype=np.float32)
+        self.phase = 0
+
+    def process(self, audio_int16):
+        if self.identity or len(audio_int16) == 0:
+            return audio_int16
+
+        x = audio_int16.astype(np.float32)
+
+        if self.up > 1:
+            upsampled = np.zeros(len(x) * self.up, dtype=np.float32)
+            upsampled[::self.up] = x
+        else:
+            upsampled = x
+
+        buffer = np.concatenate([self.state, upsampled])
+        filtered = np.convolve(buffer, self.kernel, mode="valid")
+        self.state = buffer[len(upsampled):]
+
+        if self.down > 1:
+            out = filtered[self.phase::self.down]
+            n = len(filtered)
+
+            if n > self.phase:
+                taken = (n - self.phase + self.down - 1) // self.down
+                self.phase = self.phase + taken * self.down - n
+            else:
+                self.phase -= n
+        else:
+            out = filtered
+
+        return np.clip(
+            np.rint(out),
+            -32768,
+            32767,
+        ).astype(np.int16)
+
+
 def samples_in_blocks(
     blocks,
 ):
@@ -414,6 +538,12 @@ def select_channel_blocks(
         else block
         for block in blocks
     ]
+
+
+def blocks_seconds(
+    blocks,
+):
+    return samples_in_blocks(blocks) / INPUT_RATE
 
 
 def blocks_have_seconds(
@@ -502,6 +632,109 @@ def close_input_stream():
         stream.close()
     except Exception:
         pass
+
+
+class ReferenceOutput:
+    """Permanently open far-end reference stream for the XVF3800.
+
+    PortAudio pulls from a queue of mono 16 kHz chunks in its callback
+    and plays silence when the queue is empty, so the device always has
+    a host playback stream to lock its clock to.
+    """
+
+    def __init__(self, device, rate):
+        self.rate = rate
+        self._lock = threading.Lock()
+        self._chunks = deque()
+        self._offset = 0
+        self._stream = sd.OutputStream(
+            samplerate=rate,
+            device=device,
+            channels=2,
+            dtype="int16",
+            blocksize=int(rate * 0.05),
+            callback=self._callback,
+        )
+
+    def start(self):
+        self._stream.start()
+
+    def close(self):
+        for method in (self._stream.stop, self._stream.close):
+            try:
+                method()
+            except Exception:
+                pass
+
+    def write(self, mono_int16):
+        if len(mono_int16) == 0:
+            return
+
+        with self._lock:
+            self._chunks.append(mono_int16)
+
+    def flush(self):
+        with self._lock:
+            self._chunks.clear()
+            self._offset = 0
+
+    def _callback(self, outdata, frames, time_info, status):
+        pos = 0
+
+        with self._lock:
+            while pos < frames and self._chunks:
+                chunk = self._chunks[0]
+                take = min(len(chunk) - self._offset, frames - pos)
+                segment = chunk[self._offset:self._offset + take]
+
+                outdata[pos:pos + take, 0] = segment
+                outdata[pos:pos + take, 1] = segment
+
+                pos += take
+                self._offset += take
+
+                if self._offset >= len(chunk):
+                    self._chunks.popleft()
+                    self._offset = 0
+
+        if pos < frames:
+            outdata[pos:] = 0
+
+
+reference_output = None
+
+
+def open_reference_output():
+    global reference_output
+
+    if AEC_REFERENCE_DEVICE is None or not AEC_REFERENCE_CONTINUOUS:
+        return
+
+    try:
+        output = ReferenceOutput(
+            AEC_REFERENCE_DEVICE,
+            AEC_REFERENCE_RATE,
+        )
+        output.start()
+        reference_output = output
+        print("AEC reference stream: continuous")
+
+    except Exception as exc:
+        print(
+            "WARNING: could not open a continuous AEC reference stream; "
+            f"falling back to per-reply streams: {type(exc).__name__}: {exc}"
+        )
+        reference_output = None
+
+
+def close_reference_output():
+    global reference_output
+
+    output = reference_output
+    reference_output = None
+
+    if output is not None:
+        output.close()
 
 
 # =========================================================
@@ -2897,7 +3130,9 @@ async def send_tool_output(
 
 async def play_response_audio(
     audio_bytes,
+    controller,
 ):
+    """Buffered playback (NEXUS_STREAMING_PLAYBACK=0): play a whole reply."""
     if not audio_bytes:
         return False
 
@@ -2913,6 +3148,7 @@ async def play_response_audio(
     )
 
     use_reference = AEC_REFERENCE_DEVICE is not None
+    shared_reference = reference_output if use_reference else None
 
     # Resample the complete reference once; never restart resampling at
     # chunk boundaries. The two devices consume different frame counts
@@ -2929,6 +3165,7 @@ async def play_response_audio(
         barge_in_event.clear()
         clear_barge_queue()
         clear_mic_queue()
+        controller.wait_blocks.clear()
 
         audible_stream = None
         reference_stream = None
@@ -2953,7 +3190,7 @@ async def play_response_audio(
                 blocksize=chunk_frames,
             )
 
-            if use_reference:
+            if use_reference and shared_reference is None:
                 # The ReSpeaker analog jack remains disconnected. This
                 # second stream supplies only the digital far-end signal
                 # required by the XVF3800's hardware echo canceller.
@@ -2966,8 +3203,6 @@ async def play_response_audio(
                     blocksize=int(AEC_REFERENCE_RATE * 0.05),
                 )
 
-                # Start the reference first. Separate USB/Dell clocks and
-                # driver buffering still require a physical test.
                 playback_stage = "starting AEC reference"
                 reference_stream.start()
 
@@ -3009,32 +3244,31 @@ async def play_response_audio(
                         * AEC_REFERENCE_RATE
                         // OUTPUT_RATE
                     )
-                    reference_chunk = np.repeat(
-                        reference_pcm[
-                            reference_start:reference_end
-                        ].reshape(-1, 1),
-                        2,
-                        axis=1,
-                    )
+                    reference_mono = reference_pcm[
+                        reference_start:reference_end
+                    ]
 
-                    writes.append(
-                        asyncio.to_thread(
-                            reference_stream.write,
-                            reference_chunk,
+                    if shared_reference is not None:
+                        shared_reference.write(reference_mono)
+                    else:
+                        writes.append(
+                            asyncio.to_thread(
+                                reference_stream.write,
+                                np.repeat(
+                                    reference_mono.reshape(-1, 1),
+                                    2,
+                                    axis=1,
+                                ),
+                            )
                         )
-                    )
-                    labels.append("AEC reference")
+                        labels.append("AEC reference")
 
-                # Launch the blocking writes together, then wait for
-                # every device before advancing to the next 50 ms
-                # chunk. This limits drift between their clock domains.
                 playback_stage = "writing playback audio"
                 write_results = await asyncio.gather(
                     *writes,
                     return_exceptions=True,
                 )
 
-                # Finish all writes before cleanup, even when one fails.
                 for device_label, result in zip(
                     labels,
                     write_results,
@@ -3056,6 +3290,9 @@ async def play_response_audio(
 
         finally:
             interrupted = barge_in_event.is_set()
+
+            if interrupted and shared_reference is not None:
+                shared_reference.flush()
 
             for output_stream in (
                 audible_stream,
@@ -3081,9 +3318,11 @@ async def play_response_audio(
                     pass
 
             assistant_speaking.clear()
-
-            clear_mic_queue()
             clear_barge_queue()
+
+            # After a barge-in, keep what the user said next.
+            if not interrupted:
+                clear_mic_queue()
 
     interrupted = (
         barge_in_event.is_set()
@@ -3092,6 +3331,336 @@ async def play_response_audio(
     barge_in_event.clear()
 
     return interrupted
+
+
+class ResponsePlayer:
+    """Streams one Realtime reply to the loudspeaker as it arrives.
+
+    receive_events() feeds 24 kHz PCM deltas with feed() and calls
+    finish() on response.done. A worker thread resamples, writes
+    50 ms chunks to the speaker, mirrors them to the AEC reference, and
+    stops within one chunk of a barge-in.
+    """
+
+    def __init__(self, response_id, controller):
+        self.response_id = response_id
+        self.controller = controller
+        self.queue = queue.Queue()
+        self.stop_event = threading.Event()
+        self.interrupted = False
+        self.underruns = 0
+        self.task = None
+
+    def feed(self, pcm_bytes):
+        if pcm_bytes:
+            self.queue.put(
+                np.frombuffer(pcm_bytes, dtype=np.int16)
+            )
+
+    def finish(self):
+        self.queue.put(None)
+
+    def abort(self):
+        self.interrupted = True
+        self.stop_event.set()
+        self.queue.put(None)
+
+    def _should_stop(self):
+        return (
+            self.stop_event.is_set()
+            or barge_in_event.is_set()
+        )
+
+    async def run(self):
+        async with playback_lock():
+            barge_in_event.clear()
+            clear_barge_queue()
+            clear_mic_queue()
+            self.controller.wait_blocks.clear()
+            assistant_speaking.set()
+
+            try:
+                await asyncio.to_thread(self._play)
+
+            finally:
+                assistant_speaking.clear()
+                clear_barge_queue()
+
+                interrupted = (
+                    self.interrupted
+                    or barge_in_event.is_set()
+                )
+
+                # After a barge-in, keep what the user said next.
+                if not interrupted:
+                    clear_mic_queue()
+
+        interrupted = (
+            self.interrupted
+            or barge_in_event.is_set()
+        )
+
+        barge_in_event.clear()
+
+        if self.underruns:
+            print(
+                f"Playback underruns: {self.underruns}",
+                flush=True,
+            )
+
+        return interrupted
+
+    def _play(self):
+        chunk_frames = int(OUTPUT_RATE * 0.05)
+        prebuffer_frames = int(OUTPUT_RATE * PLAYBACK_PREBUFFER_SECONDS)
+
+        to_output = StreamResampler(MODEL_RATE, OUTPUT_RATE)
+
+        use_reference = AEC_REFERENCE_DEVICE is not None
+        shared_reference = reference_output if use_reference else None
+        to_reference = (
+            StreamResampler(MODEL_RATE, AEC_REFERENCE_RATE)
+            if use_reference
+            else None
+        )
+
+        pending48 = np.zeros(0, dtype=np.int16)
+        pending16 = np.zeros(0, dtype=np.int16)
+        done = False
+
+        audible = None
+        own_reference = None
+        stage = "opening speaker output (48000 Hz, mono)"
+
+        def absorb(item):
+            nonlocal pending48, pending16
+            pending48 = np.concatenate([pending48, to_output.process(item)])
+            if to_reference is not None:
+                pending16 = np.concatenate(
+                    [pending16, to_reference.process(item)]
+                )
+
+        def write_reference(chunk16):
+            if to_reference is None:
+                return
+            if shared_reference is not None:
+                shared_reference.write(chunk16)
+            else:
+                own_reference.write(
+                    np.repeat(chunk16.reshape(-1, 1), 2, axis=1)
+                )
+
+        try:
+            audible = sd.OutputStream(
+                samplerate=OUTPUT_RATE,
+                device=OUTPUT_DEVICE,
+                channels=1,
+                dtype="int16",
+                blocksize=chunk_frames,
+            )
+
+            if use_reference and shared_reference is None:
+                stage = "opening AEC reference (16000 Hz, stereo)"
+                own_reference = sd.OutputStream(
+                    samplerate=AEC_REFERENCE_RATE,
+                    device=AEC_REFERENCE_DEVICE,
+                    channels=2,
+                    dtype="int16",
+                    blocksize=int(AEC_REFERENCE_RATE * 0.05),
+                )
+
+            # Pre-buffer a little so a slow start to generation does
+            # not underrun the device on the first words.
+            while (
+                len(pending48) < prebuffer_frames
+                and not done
+                and not self._should_stop()
+            ):
+                try:
+                    item = self.queue.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+
+                if item is None:
+                    done = True
+                else:
+                    absorb(item)
+
+            if self._should_stop():
+                self.interrupted = True
+                return
+
+            if own_reference is not None:
+                stage = "starting AEC reference"
+                own_reference.start()
+
+            stage = "starting speaker output"
+            audible.start()
+
+            while not self._should_stop():
+                # Top up from the network while less than one chunk
+                # is ready. Give up quickly so the device stays fed.
+                while len(pending48) < chunk_frames and not done:
+                    try:
+                        item = self.queue.get(timeout=0.05)
+                    except queue.Empty:
+                        break
+
+                    if item is None:
+                        done = True
+                    else:
+                        absorb(item)
+
+                if len(pending48) == 0:
+                    if done:
+                        break
+
+                    # Generation has fallen behind real time. Keep the
+                    # streams alive with silence rather than let ALSA
+                    # underrun.
+                    self.underruns += 1
+                    chunk48 = np.zeros(chunk_frames, dtype=np.int16)
+                    chunk16 = np.zeros(
+                        chunk_frames * AEC_REFERENCE_RATE // OUTPUT_RATE,
+                        dtype=np.int16,
+                    )
+                else:
+                    n = min(chunk_frames, len(pending48))
+                    chunk48 = pending48[:n]
+                    pending48 = pending48[n:]
+
+                    if done and len(pending48) == 0:
+                        n16 = len(pending16)
+                    else:
+                        n16 = min(
+                            len(pending16),
+                            int(round(n * AEC_REFERENCE_RATE / OUTPUT_RATE)),
+                        )
+
+                    chunk16 = pending16[:n16]
+                    pending16 = pending16[n16:]
+
+                stage = "writing playback audio"
+                write_reference(chunk16)
+                audible.write(chunk48.reshape(-1, 1))
+
+            if self._should_stop():
+                self.interrupted = True
+
+        except sd.PortAudioError as exc:
+            print(
+                f"Audio playback failure while {stage}: {exc}",
+                flush=True,
+            )
+            raise
+
+        finally:
+            if self.interrupted and shared_reference is not None:
+                shared_reference.flush()
+
+            for stream in (audible, own_reference):
+                if stream is None:
+                    continue
+
+                try:
+                    if self.interrupted:
+                        stream.abort()
+                    else:
+                        stream.stop()
+                except Exception:
+                    pass
+
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
+
+async def open_followup(
+    ws,
+    controller,
+    interrupted,
+):
+    controller.start_followup(
+        interrupted=interrupted
+    )
+
+    print()
+
+    if interrupted:
+        print(
+            "Playback stopped."
+        )
+        print(
+            "Listening for your new request "
+            f"for {FOLLOWUP_SECONDS:.0f}s."
+        )
+    else:
+        print(
+            "Follow-up window open "
+            f"for {FOLLOWUP_SECONDS:.0f}s."
+        )
+        print(
+            "Listening briefly for "
+            "a direct follow-up."
+        )
+
+
+async def run_player(
+    ws,
+    controller,
+    player,
+):
+    try:
+        interrupted = await player.run()
+
+    except asyncio.CancelledError:
+        raise
+
+    except Exception as exc:
+        # Local audio failures must not discard a healthy Realtime
+        # session or trigger network reconnection.
+        print(
+            "Response playback failed; keeping Realtime connected: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        if controller.player is player:
+            controller.player = None
+
+        try:
+            await clear_openai_input(ws)
+        except Exception:
+            pass
+
+        controller.return_to_wake()
+        return
+
+    finally:
+        if controller.player is player:
+            controller.player = None
+
+    if (
+        interrupted
+        and controller.response_active
+        and controller.current_response_id == player.response_id
+    ):
+        # The server is still generating this reply. Stop it so no
+        # more audio arrives for a response nobody is listening to.
+        controller.cancelled_response_id = player.response_id
+
+        try:
+            await ws.send(
+                json.dumps({"type": "response.cancel"})
+            )
+        except Exception:
+            pass
+
+    await open_followup(
+        ws,
+        controller,
+        interrupted,
+    )
 
 
 # =========================================================
@@ -3124,31 +3693,64 @@ class NexusController:
             AssistantState.WAIT_WAKE
         )
 
+        # Stereo blocks awaiting speaker verification.
         self.verify_blocks = []
+
+        # Strict mode: stereo blocks gathered during the follow-up
+        # window before verification.
         self.followup_blocks = []
 
-        # Audio captured while the enrolled speaker interrupts
-        # Nexus during playback.
-        self.interrupt_blocks = []
+        # Mono blocks to send to OpenAI before live audio resumes
+        # (wake-word pre-roll, or speech captured after a barge-in).
+        self.pending_send_blocks = []
+
+        # Clear the server's input buffer before the next send.
+        self.pending_input_clear = False
+
+        # Microphone audio captured while a reply is pending or
+        # just after it was interrupted.
+        self.wait_blocks = deque(maxlen=WAIT_BLOCKS_MAX)
+
+        # Rolling window of recent ACTIVE audio, used to back-fill
+        # the verification buffer when the server reports speech.
+        self.recent_blocks = deque(maxlen=RECENT_BLOCKS_MAX)
 
         self.active_channel = 0
+        self.active_origin = "wake"
+        self.verification_pending = False
         self.followup_deadline = 0.0
         self.active_deadline = 0.0
         self.wake_cooldown_until = 0.0
         self.response_active = False
         self.speech_started_seen = False
 
+        # Streaming playback bookkeeping.
+        self.player = None
+        self.current_response_id = None
+        self.cancelled_response_id = None
+
 
     def enter_active(
         self,
         channel,
+        origin="wake",
+        verification_pending=False,
+        timeout=None,
     ):
         self.active_channel = channel
+        self.active_origin = origin
+        self.verification_pending = verification_pending
         self.speech_started_seen = False
+        self.recent_blocks.clear()
+
+        if timeout is None:
+            timeout = ACTIVE_SPEECH_TIMEOUT_SECONDS
+
         self.active_deadline = (
             time.monotonic()
-            + ACTIVE_SPEECH_TIMEOUT_SECONDS
+            + timeout
         )
+
         self.state = (
             AssistantState.ACTIVE
         )
@@ -3156,58 +3758,94 @@ class NexusController:
 
     def start_followup(
         self,
+        interrupted=False,
     ):
-        self.verify_blocks.clear()
-
-        # If playback was interrupted, begin the follow-up
-        # with the speech that was already captured while
-        # Nexus was still talking.
-        if self.interrupt_blocks:
-            self.followup_blocks = [
-                (
-                    block[0].copy(),
-                    block[1].copy(),
-                )
-                for block
-                in self.interrupt_blocks
-            ]
-
-            self.interrupt_blocks.clear()
-
-            print(
-                "Preserved interruption audio for follow-up.",
-                flush=True,
-            )
-        else:
-            self.followup_blocks.clear()
-
+        self.verify_blocks = []
+        self.pending_send_blocks = []
         self.speech_started_seen = False
 
-        self.followup_deadline = (
-            time.monotonic()
-            + FOLLOWUP_SECONDS
+        if SPEAKER_VERIFY_MODE == "strict":
+            self.followup_blocks.clear()
+            self.wait_blocks.clear()
+
+            self.followup_deadline = (
+                time.monotonic()
+                + FOLLOWUP_SECONDS
+            )
+
+            self.state = (
+                AssistantState.FOLLOWUP
+            )
+            return
+
+        # Soft/off: open the microphone to OpenAI immediately, like a
+        # smart speaker's follow-up mode. If playback was interrupted,
+        # begin with the speech captured since the interruption.
+        if interrupted and self.wait_blocks:
+            blocks = list(self.wait_blocks)
+
+            self.pending_send_blocks = select_channel_blocks(
+                blocks,
+                self.active_channel,
+            )
+
+            self.verify_blocks = [
+                (block[0].copy(), block[1].copy())
+                for block in blocks
+            ]
+
+        self.wait_blocks.clear()
+        self.followup_blocks.clear()
+
+        self.enter_active(
+            self.active_channel,
+            origin="interrupt" if interrupted else "followup",
+            verification_pending=(
+                SPEAKER_VERIFY_MODE == "soft"
+            ),
+            timeout=FOLLOWUP_SECONDS,
         )
 
-        self.state = (
-            AssistantState.FOLLOWUP
-        )
+        self.pending_input_clear = True
+
+
+    def _clear_buffers(
+        self,
+    ):
+        self.verify_blocks = []
+        self.followup_blocks.clear()
+        self.pending_send_blocks = []
+        self.pending_input_clear = False
+        self.wait_blocks.clear()
+        self.recent_blocks.clear()
+        self.verification_pending = False
+        self.speech_started_seen = False
+
+        wake_preroll.clear()
+        clear_mic_queue()
+
 
     def reset_for_connection(
         self,
     ):
-        self.verify_blocks.clear()
-        self.followup_blocks.clear()
-        self.interrupt_blocks.clear()
+        player = self.player
+        self.player = None
+
+        if player is not None:
+            player.abort()
+
+            if player.task is not None:
+                player.task.cancel()
+
+        self._clear_buffers()
 
         self.response_active = False
-        self.speech_started_seen = False
+        self.current_response_id = None
+        self.cancelled_response_id = None
         self.followup_deadline = 0.0
         self.active_deadline = 0.0
         self.wake_cooldown_until = 0.0
         self.active_channel = 0
-
-        wake_preroll.clear()
-        clear_mic_queue()
 
         self.state = (
             AssistantState.WAIT_WAKE
@@ -3218,13 +3856,7 @@ class NexusController:
         self,
         rejected=False,
     ):
-        self.verify_blocks.clear()
-        self.followup_blocks.clear()
-        self.interrupt_blocks.clear()
-
-        wake_preroll.clear()
-        clear_mic_queue()
-        self.speech_started_seen = False
+        self._clear_buffers()
 
         if rejected:
             self.wake_cooldown_until = (
@@ -3241,6 +3873,120 @@ class NexusController:
         print(
             'Waiting for "Hey Nexus"...'
         )
+
+
+async def score_speaker(
+    controller,
+    blocks,
+):
+    """Return (similarity_ch0, similarity_ch1) for stereo blocks."""
+    audio0 = np.concatenate(
+        select_channel_blocks(blocks, 0)
+    )
+    audio1 = np.concatenate(
+        select_channel_blocks(blocks, 1)
+    )
+
+    return await asyncio.gather(
+        asyncio.to_thread(
+            speaker_similarity,
+            controller.recognizer,
+            controller.enrolled_embeddings[0],
+            audio0,
+        ),
+        asyncio.to_thread(
+            speaker_similarity,
+            controller.recognizer,
+            controller.enrolled_embeddings[1],
+            audio1,
+        ),
+    )
+
+
+async def reject_current_speaker(
+    ws,
+    controller,
+):
+    """Soft mode: undo a request already in flight for a rejected speaker."""
+    try:
+        await clear_openai_input(ws)
+    except Exception:
+        pass
+
+    if (
+        controller.response_active
+        and controller.current_response_id
+    ):
+        controller.cancelled_response_id = (
+            controller.current_response_id
+        )
+
+        try:
+            await ws.send(
+                json.dumps({"type": "response.cancel"})
+            )
+        except Exception:
+            pass
+
+    if controller.player is not None:
+        controller.player.abort()
+
+    controller.return_to_wake(
+        rejected=True
+    )
+
+
+async def verify_speaker(
+    ws,
+    controller,
+    context,
+):
+    """Soft mode: judge the speaker on the audio gathered so far.
+
+    Returns True when the request may continue. On rejection the
+    request is cancelled and the controller returns to wake.
+    """
+    blocks = controller.verify_blocks
+    controller.verify_blocks = []
+    controller.verification_pending = False
+
+    if not blocks:
+        return True
+
+    similarity0, similarity1 = await score_speaker(
+        controller,
+        blocks,
+    )
+
+    winner = 0 if similarity0 >= similarity1 else 1
+    best_similarity = max(similarity0, similarity1)
+
+    print(
+        f"{context} speaker CH0: {similarity0:.3f}   "
+        f"CH1: {similarity1:.3f}   "
+        f"winner: CH{winner}   "
+        f"({blocks_seconds(blocks):.1f}s)"
+    )
+
+    if best_similarity < SPEAKER_THRESHOLD:
+        print(
+            "Speaker rejected."
+        )
+        await reject_current_speaker(ws, controller)
+        return False
+
+    if winner != controller.active_channel:
+        print(
+            f"Switching to microphone channel {winner}."
+        )
+
+    controller.active_channel = winner
+
+    print(
+        "Speaker accepted."
+    )
+
+    return True
 
 
 # =========================================================
@@ -3317,9 +4063,6 @@ async def process_microphone(
                 f"CH1: {score1:.3f}   "
                 f"winner: CH{wake_winner}"
             )
-            print(
-                "Checking speaker on both channels..."
-            )
 
             controller.verify_blocks = [
                 (b[0].copy(), b[1].copy())
@@ -3327,9 +4070,44 @@ async def process_microphone(
             ]
 
             wake_preroll.clear()
-            controller.state = (
-                AssistantState.VERIFY_WAKE
+
+            if SPEAKER_VERIFY_MODE == "strict":
+                print(
+                    "Checking speaker on both channels..."
+                )
+                controller.state = (
+                    AssistantState.VERIFY_WAKE
+                )
+                continue
+
+            # Soft/off: start streaming now. The pre-roll (which
+            # contains the wake phrase) goes first so the server's VAD
+            # sees the start of the utterance.
+            controller.enter_active(
+                wake_winner,
+                origin="wake",
+                verification_pending=(
+                    SPEAKER_VERIFY_MODE == "soft"
+                ),
             )
+
+            controller.pending_send_blocks = select_channel_blocks(
+                controller.verify_blocks,
+                wake_winner,
+            )
+            controller.pending_input_clear = True
+
+            if SPEAKER_VERIFY_MODE == "soft":
+                print(
+                    "Listening for request; "
+                    "verifying speaker in parallel..."
+                )
+            else:
+                controller.verify_blocks = []
+                print(
+                    "Listening for request..."
+                )
+
             continue
 
         if (
@@ -3346,34 +4124,9 @@ async def process_microphone(
             ):
                 continue
 
-            audio0 = np.concatenate(
-                select_channel_blocks(
-                    controller.verify_blocks,
-                    0,
-                )
-            )
-            audio1 = np.concatenate(
-                select_channel_blocks(
-                    controller.verify_blocks,
-                    1,
-                )
-            )
-
-            similarity0, similarity1 = (
-                await asyncio.gather(
-                    asyncio.to_thread(
-                        speaker_similarity,
-                        controller.recognizer,
-                        controller.enrolled_embeddings[0],
-                        audio0,
-                    ),
-                    asyncio.to_thread(
-                        speaker_similarity,
-                        controller.recognizer,
-                        controller.enrolled_embeddings[1],
-                        audio1,
-                    ),
-                )
+            similarity0, similarity1 = await score_speaker(
+                controller,
+                controller.verify_blocks,
             )
 
             winner = (
@@ -3424,7 +4177,7 @@ async def process_microphone(
                 ),
             )
 
-            controller.verify_blocks.clear()
+            controller.verify_blocks = []
             continue
 
         if (
@@ -3437,10 +4190,15 @@ async def process_microphone(
                 time.monotonic()
                 >= controller.active_deadline
             ):
-                print(
-                    "No speech detected; "
-                    "stopping microphone upload."
-                )
+                if controller.active_origin == "wake":
+                    print(
+                        "No speech detected; "
+                        "stopping microphone upload."
+                    )
+                else:
+                    print(
+                        "Follow-up window closed."
+                    )
 
                 try:
                     await clear_openai_input(
@@ -3452,6 +4210,51 @@ async def process_microphone(
                 controller.return_to_wake()
                 continue
 
+            if controller.pending_input_clear:
+                controller.pending_input_clear = False
+                await clear_openai_input(
+                    ws
+                )
+
+            if controller.pending_send_blocks:
+                blocks = controller.pending_send_blocks
+                controller.pending_send_blocks = []
+                await send_blocks_to_openai(
+                    ws,
+                    blocks,
+                )
+
+            controller.recent_blocks.append(
+                block
+            )
+
+            if controller.verification_pending:
+                # Collect from the start for a wake-word activation
+                # (the pre-roll holds the phrase); for follow-ups,
+                # wait until the server reports speech so silence is
+                # not what gets judged.
+                if (
+                    controller.active_origin == "wake"
+                    or controller.speech_started_seen
+                    or controller.verify_blocks
+                ):
+                    controller.verify_blocks.append(
+                        block
+                    )
+
+                if blocks_have_seconds(
+                    controller.verify_blocks,
+                    SOFT_VERIFY_SECONDS,
+                ):
+                    accepted = await verify_speaker(
+                        ws,
+                        controller,
+                        "Request",
+                    )
+
+                    if not accepted:
+                        continue
+
             await send_pcm_to_openai(
                 ws,
                 block[controller.active_channel],
@@ -3462,12 +4265,17 @@ async def process_microphone(
             controller.state
             == AssistantState.WAIT_RESPONSE
         ):
+            # Kept so speech right after a barge-in is not lost.
+            controller.wait_blocks.append(
+                block
+            )
             continue
 
         if (
             controller.state
             == AssistantState.FOLLOWUP
         ):
+            # Strict mode only.
             if (
                 time.monotonic()
                 >= controller.followup_deadline
@@ -3488,34 +4296,9 @@ async def process_microphone(
             ):
                 continue
 
-            audio0 = np.concatenate(
-                select_channel_blocks(
-                    controller.followup_blocks,
-                    0,
-                )
-            )
-            audio1 = np.concatenate(
-                select_channel_blocks(
-                    controller.followup_blocks,
-                    1,
-                )
-            )
-
-            similarity0, similarity1 = (
-                await asyncio.gather(
-                    asyncio.to_thread(
-                        speaker_similarity,
-                        controller.recognizer,
-                        controller.enrolled_embeddings[0],
-                        audio0,
-                    ),
-                    asyncio.to_thread(
-                        speaker_similarity,
-                        controller.recognizer,
-                        controller.enrolled_embeddings[1],
-                        audio1,
-                    ),
-                )
+            similarity0, similarity1 = await score_speaker(
+                controller,
+                controller.followup_blocks,
             )
 
             winner = (
@@ -3541,7 +4324,8 @@ async def process_microphone(
                 )
 
                 controller.enter_active(
-                    winner
+                    winner,
+                    origin="followup",
                 )
 
                 await clear_openai_input(
@@ -3568,6 +4352,19 @@ async def process_microphone(
             overlap_samples = int(
                 FOLLOWUP_OVERLAP_SECONDS
                 * INPUT_RATE
+            )
+
+            audio0 = np.concatenate(
+                select_channel_blocks(
+                    controller.followup_blocks,
+                    0,
+                )
+            )
+            audio1 = np.concatenate(
+                select_channel_blocks(
+                    controller.followup_blocks,
+                    1,
+                )
             )
 
             if len(audio0) > overlap_samples:
@@ -3622,6 +4419,18 @@ async def receive_events(
             ):
                 controller.speech_started_seen = True
 
+                # Soft follow-up: judge the speaker from just before
+                # the server noticed speech, not from the silence
+                # that preceded it.
+                if (
+                    controller.verification_pending
+                    and not controller.verify_blocks
+                ):
+                    controller.verify_blocks = [
+                        (b[0].copy(), b[1].copy())
+                        for b in controller.recent_blocks
+                    ]
+
                 print()
 
                 print(
@@ -3646,9 +4455,20 @@ async def receive_events(
                     "You stopped speaking."
                 )
 
+                if controller.verification_pending:
+                    accepted = await verify_speaker(
+                        ws,
+                        controller,
+                        "Request",
+                    )
+
+                    if not accepted:
+                        continue
+
                 controller.state = (
                     AssistantState.WAIT_RESPONSE
                 )
+                controller.wait_blocks.clear()
 
                 controller.response_active = True
 
@@ -3663,6 +4483,10 @@ async def receive_events(
         elif event_type == "response.created":
             response_audio.clear()
 
+            controller.current_response_id = (
+                message.get("response", {}).get("id")
+            )
+
         elif (
             event_type
             == "response.output_audio.delta"
@@ -3671,12 +4495,59 @@ async def receive_events(
                 "delta"
             )
 
-            if delta:
+            if not delta:
+                continue
+
+            if not STREAMING_PLAYBACK:
                 response_audio.extend(
                     base64.b64decode(
                         delta
                     )
                 )
+                continue
+
+            response_id = message.get(
+                "response_id"
+            )
+
+            if (
+                response_id is not None
+                and response_id == controller.cancelled_response_id
+            ):
+                # Audio still draining from a cancelled reply.
+                continue
+
+            player = controller.player
+
+            if (
+                player is None
+                or player.response_id != response_id
+            ):
+                if player is not None:
+                    player.finish()
+
+                player = ResponsePlayer(
+                    response_id,
+                    controller,
+                )
+                controller.player = player
+                player.task = asyncio.create_task(
+                    run_player(
+                        ws,
+                        controller,
+                        player,
+                    )
+                )
+
+                print(
+                    "Speaking..."
+                )
+
+            player.feed(
+                base64.b64decode(
+                    delta
+                )
+            )
 
         elif (
             event_type
@@ -3704,6 +4575,10 @@ async def receive_events(
             response = message.get(
                 "response",
                 {},
+            )
+
+            response_id = response.get(
+                "id"
             )
 
             output = response.get(
@@ -3799,6 +4674,27 @@ async def receive_events(
                     status,
                 )
 
+            if (
+                response_id is not None
+                and response_id == controller.cancelled_response_id
+            ):
+                # Cancelled after a barge-in or speaker rejection;
+                # whoever cancelled it has already moved the state on.
+                controller.cancelled_response_id = None
+                continue
+
+            player = controller.player
+
+            if (
+                STREAMING_PLAYBACK
+                and player is not None
+                and player.response_id == response_id
+            ):
+                # run_player opens the follow-up window once the
+                # remaining audio has drained.
+                player.finish()
+                continue
+
             if response_audio:
                 print(
                     "Speaking..."
@@ -3811,7 +4707,10 @@ async def receive_events(
                 response_audio.clear()
 
                 try:
-                    interrupted = await play_response_audio(audio_copy)
+                    interrupted = await play_response_audio(
+                        audio_copy,
+                        controller,
+                    )
                 except sd.PortAudioError:
                     # Local audio failures must not discard a healthy
                     # Realtime session or trigger network reconnection.
@@ -3820,49 +4719,18 @@ async def receive_events(
                     controller.return_to_wake()
                     continue
 
-                if interrupted:
-                    try:
-                        await clear_openai_input(
-                            ws
-                        )
-
-                    except Exception:
-                        pass
-
-                    controller.start_followup()
-
-                    print()
-                    print(
-                        "Playback stopped."
-                    )
-
-                    print(
-                        "Listening for your new request "
-                        f"for {FOLLOWUP_SECONDS:.0f}s."
-                    )
-
-                    continue
-
-            try:
-                await clear_openai_input(
-                    ws
+                await open_followup(
+                    ws,
+                    controller,
+                    interrupted,
                 )
+                continue
 
-            except Exception:
-                pass
-
-            controller.start_followup()
-
-            print()
-
-            print(
-                "Follow-up window open "
-                f"for {FOLLOWUP_SECONDS:.0f}s."
-            )
-
-            print(
-                "Listening briefly for "
-                "a direct follow-up."
+            # No audio in this reply.
+            await open_followup(
+                ws,
+                controller,
+                False,
             )
 
         elif event_type == "error":
@@ -4752,6 +5620,19 @@ async def main():
     )
 
     print(
+        "Playback: "
+        + (
+            f"streaming (pre-buffer {PLAYBACK_PREBUFFER_SECONDS:.1f}s)"
+            if STREAMING_PLAYBACK
+            else "buffered"
+        )
+    )
+
+    print(
+        f"Speaker verification: {SPEAKER_VERIFY_MODE}"
+    )
+
+    print(
         "Local timers: enabled"
     )
 
@@ -4913,6 +5794,10 @@ async def main():
         open_input_stream
     )
 
+    await asyncio.to_thread(
+        open_reference_output
+    )
+
     try:
         await connection_manager(
             api_key,
@@ -4922,6 +5807,10 @@ async def main():
         )
 
     finally:
+        await asyncio.to_thread(
+            close_reference_output
+        )
+
         await asyncio.to_thread(
             close_input_stream
         )
