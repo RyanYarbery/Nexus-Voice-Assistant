@@ -53,6 +53,7 @@ ns["speaker_similarity"] = lambda rec, emb, audio: script["speaker"]
 ns["FOLLOWUP_SECONDS"] = 0.6
 ns["ACTIVE_SPEECH_TIMEOUT_SECONDS"] = 1.0
 ns["SOFT_VERIFY_SECONDS"] = 1.0
+ns["WAKE_RESUME_COOLDOWN_SECONDS"] = 0.0   # scenarios re-wake immediately
 ns["PLAYBACK_PREBUFFER_SECONDS"] = 0.1
 assert ns["SPEAKER_VERIFY_MODE"] == "soft" and ns["STREAMING_PLAYBACK"]
 
@@ -166,22 +167,27 @@ async def rejected(ws, c):
     assert c.wake_cooldown_until > time.monotonic()
 
 async def rejected_midstream(ws, c):
-    # Speaker judged at SOFT_VERIFY_SECONDS of audio before speech stops.
+    # Speaker judged once SOFT_VERIFY_SECONDS of audio has arrived and the
+    # server has reported at least SOFT_VERIFY_SPEECH_SECONDS of speech.
     script["wake"] = 0.0; script["speaker"] = 0.1
     await feed_mic(3); script["wake"] = 0.5; await feed_mic(1); script["wake"] = 0.0
     await wait_for(lambda: c.state == A.ACTIVE, what="ACTIVE")
-    await feed_mic(16)   # ~1.3 s with pre-roll
+    await feed_mic(16)   # ~1.3 s with pre-roll, no speech yet: must not judge
+    assert c.state == A.ACTIVE, "judged before the server reported speech"
+    ws.events.put_nowait({"type": "input_audio_buffer.speech_started"}); await asyncio.sleep(0.02)
+    await feed_mic(13)   # ~1.0 s of speech
     await wait_for(lambda: c.state == A.WAIT_WAKE, what="mid-stream rejection")
 
 async def strict_buffered(ws, c):
-    # Original behaviour: hold audio until 1.2 s is verified; buffered playback.
+    # Original behaviour: hold audio until SPEAKER_VERIFY_SECONDS (1.6 s) is
+    # verified; buffered playback.
     ns["SPEAKER_VERIFY_MODE"] = "strict"; ns["STREAMING_PLAYBACK"] = False
     try:
         script["wake"] = 0.0; script["speaker"] = 0.6
         await feed_mic(3); script["wake"] = 0.5; await feed_mic(1); script["wake"] = 0.0
         await wait_for(lambda: c.state == A.VERIFY_WAKE, what="VERIFY_WAKE")
         assert ws.sent == []                      # nothing leaves the machine yet
-        await feed_mic(16)                        # 1.28 s
+        await feed_mic(20)                        # 1.6 s
         await wait_for(lambda: c.state == A.ACTIVE, what="ACTIVE after strict verify")
         assert ws.types()[:2] == ["input_audio_buffer.clear", "input_audio_buffer.append"]
         ws.events.put_nowait({"type": "input_audio_buffer.speech_started"}); await asyncio.sleep(0.02)

@@ -144,10 +144,33 @@ SPEAKER_THRESHOLD = 0.25
 
 INPUT_BLOCK_FRAMES = 1280
 
-WAKE_PREROLL_SECONDS = 0.8
-SPEAKER_VERIFY_SECONDS = 1.2
+WAKE_PREROLL_SECONDS = 1.0
+SPEAKER_VERIFY_SECONDS = 1.6
+
+# Speech-aware speaker verification.  Instead of scoring arbitrary
+# fixed windows, find the strongest contiguous speech region around
+# the wake phrase, trim surrounding silence/noise, and verify that.
+SPEAKER_VAD_FRAME_MS = 20
+SPEAKER_VAD_HOP_MS = 10
+SPEAKER_VAD_NOISE_MULTIPLIER = 2.2
+SPEAKER_VAD_PEAK_FRACTION = 0.12
+SPEAKER_VAD_ABSOLUTE_FLOOR = 20.0
+SPEAKER_VAD_MAX_GAP_MS = 180
+SPEAKER_VAD_MARGIN_MS = 120
+SPEAKER_VAD_MIN_SECONDS = 0.45
+SPEAKER_VAD_MAX_SECONDS = 1.35
 
 WAKE_REJECT_COOLDOWN_SECONDS = 1.0
+
+# The wake models are not fed while a request is active, so their
+# feature buffers still end with the last wake phrase when listening
+# resumes. Keep scoring (to flush them) but ignore detections for this
+# long after every return to wake, or the old phrase fires again.
+WAKE_RESUME_COOLDOWN_SECONDS = 2.0
+
+# When the speech-aware trimmer finds less than this much speech, the
+# untrimmed window is scored as well and the better score is used.
+SPEAKER_VAD_FALLBACK_SECONDS = 0.8
 
 FOLLOWUP_SECONDS = 5.0
 FOLLOWUP_VERIFY_SECONDS = 2.2
@@ -234,6 +257,19 @@ if SPEAKER_VERIFY_MODE not in ("soft", "strict", "off"):
 # Soft mode judges the speaker on up to this much audio (wake-word
 # pre-roll included), or on whatever has arrived when speech stops.
 SOFT_VERIFY_SECONDS = 2.5
+
+# The timed soft check waits until the server has reported speech and at
+# least this much of it has arrived, so a pause after the wake phrase is
+# not judged as if it were the request.
+SOFT_VERIFY_SPEECH_SECONDS = 1.0
+
+# Trim the verification audio to the strongest speech region before
+# scoring, so silence and room noise around the phrase do not dilute
+# the embedding. 0 scores the raw window instead.
+SPEAKER_SPEECH_AWARE = os.environ.get(
+    "NEXUS_SPEAKER_SPEECH_AWARE",
+    "1",
+).strip().lower() not in ("0", "false", "no", "off")
 
 # Microphone audio kept while waiting for a reply so that speech
 # captured right after a barge-in is not lost.
@@ -936,6 +972,395 @@ def speaker_similarity(
             enrolled_embedding,
             embedding,
         )
+    )
+
+
+def extract_speech_region(
+    audio_int16,
+):
+    """Return the strongest contiguous speech region and diagnostics.
+
+    This is intentionally lightweight and local: it uses short-frame RMS,
+    an adaptive threshold based on the recording's noise floor and peak,
+    bridges brief intra-word gaps, then chooses the highest-energy region.
+    """
+    total_samples = len(audio_int16)
+
+    if total_samples == 0:
+        return (
+            audio_int16,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        )
+
+    frame_samples = max(
+        1,
+        int(
+            INPUT_RATE
+            * SPEAKER_VAD_FRAME_MS
+            / 1000
+        ),
+    )
+
+    hop_samples = max(
+        1,
+        int(
+            INPUT_RATE
+            * SPEAKER_VAD_HOP_MS
+            / 1000
+        ),
+    )
+
+    if total_samples <= frame_samples:
+        audio_float = audio_int16.astype(
+            np.float32
+        )
+        rms = float(
+            np.sqrt(
+                np.mean(
+                    audio_float
+                    * audio_float
+                )
+            )
+        )
+        return (
+            audio_int16,
+            0.0,
+            total_samples / INPUT_RATE,
+            rms,
+            rms,
+        )
+
+    audio_float = audio_int16.astype(
+        np.float32
+    )
+
+    starts = np.arange(
+        0,
+        total_samples - frame_samples + 1,
+        hop_samples,
+        dtype=np.int64,
+    )
+
+    frame_rms = np.empty(
+        len(starts),
+        dtype=np.float32,
+    )
+
+    for i, frame_start in enumerate(
+        starts
+    ):
+        frame = audio_float[
+            frame_start:
+            frame_start + frame_samples
+        ]
+
+        frame_rms[i] = np.sqrt(
+            np.mean(
+                frame * frame
+            )
+        )
+
+    peak_rms = float(
+        np.max(
+            frame_rms
+        )
+    )
+
+    noise_floor = float(
+        np.percentile(
+            frame_rms,
+            25,
+        )
+    )
+
+    threshold = max(
+        SPEAKER_VAD_ABSOLUTE_FLOOR,
+        noise_floor
+        * SPEAKER_VAD_NOISE_MULTIPLIER,
+        peak_rms
+        * SPEAKER_VAD_PEAK_FRACTION,
+    )
+
+    active = (
+        frame_rms >= threshold
+    )
+
+    # Bridge short gaps between active frames so pauses between "Hey"
+    # and "Nexus" remain one speech segment.
+    max_gap_frames = max(
+        1,
+        int(
+            SPEAKER_VAD_MAX_GAP_MS
+            / SPEAKER_VAD_HOP_MS
+        ),
+    )
+
+    active_indices = np.flatnonzero(
+        active
+    )
+
+    if len(active_indices) == 0:
+        # Extremely quiet fallback: center a minimum-length region
+        # around the loudest frame rather than scoring pure silence.
+        peak_index = int(
+            np.argmax(
+                frame_rms
+            )
+        )
+
+        center_sample = int(
+            starts[peak_index]
+            + frame_samples // 2
+        )
+
+        target_samples = min(
+            total_samples,
+            max(
+                frame_samples,
+                int(
+                    SPEAKER_VAD_MIN_SECONDS
+                    * INPUT_RATE
+                ),
+            ),
+        )
+
+        region_start = max(
+            0,
+            center_sample
+            - target_samples // 2,
+        )
+        region_end = min(
+            total_samples,
+            region_start
+            + target_samples,
+        )
+        region_start = max(
+            0,
+            region_end
+            - target_samples,
+        )
+
+    else:
+        groups = []
+        group_start = int(
+            active_indices[0]
+        )
+        previous = group_start
+
+        for index in active_indices[1:]:
+            index = int(index)
+
+            if (
+                index - previous
+                > max_gap_frames
+            ):
+                groups.append(
+                    (
+                        group_start,
+                        previous,
+                    )
+                )
+                group_start = index
+
+            previous = index
+
+        groups.append(
+            (
+                group_start,
+                previous,
+            )
+        )
+
+        # Prefer the group containing the most speech energy, not merely
+        # the longest group. That keeps a low-level background sound from
+        # beating the actual wake phrase.
+        best_group = max(
+            groups,
+            key=lambda group: float(
+                np.sum(
+                    frame_rms[
+                        group[0]:
+                        group[1] + 1
+                    ]
+                    ** 2
+                )
+            ),
+        )
+
+        region_start = int(
+            starts[
+                best_group[0]
+            ]
+        )
+
+        region_end = int(
+            starts[
+                best_group[1]
+            ]
+            + frame_samples
+        )
+
+        margin_samples = int(
+            SPEAKER_VAD_MARGIN_MS
+            * INPUT_RATE
+            / 1000
+        )
+
+        region_start = max(
+            0,
+            region_start
+            - margin_samples,
+        )
+
+        region_end = min(
+            total_samples,
+            region_end
+            + margin_samples,
+        )
+
+        min_samples = int(
+            SPEAKER_VAD_MIN_SECONDS
+            * INPUT_RATE
+        )
+
+        if (
+            region_end - region_start
+            < min_samples
+        ):
+            center = (
+                region_start
+                + region_end
+            ) // 2
+
+            region_start = max(
+                0,
+                center
+                - min_samples // 2,
+            )
+
+            region_end = min(
+                total_samples,
+                region_start
+                + min_samples,
+            )
+
+            region_start = max(
+                0,
+                region_end
+                - min_samples,
+            )
+
+        max_samples = int(
+            SPEAKER_VAD_MAX_SECONDS
+            * INPUT_RATE
+        )
+
+        if (
+            region_end - region_start
+            > max_samples
+        ):
+            # Keep the strongest portion if speech/noise spans too much
+            # of the verification buffer.
+            group_slice = frame_rms[
+                best_group[0]:
+                best_group[1] + 1
+            ]
+
+            peak_relative = int(
+                np.argmax(
+                    group_slice
+                )
+            )
+
+            peak_frame = (
+                best_group[0]
+                + peak_relative
+            )
+
+            center = int(
+                starts[peak_frame]
+                + frame_samples // 2
+            )
+
+            region_start = max(
+                0,
+                center
+                - max_samples // 2,
+            )
+
+            region_end = min(
+                total_samples,
+                region_start
+                + max_samples,
+            )
+
+            region_start = max(
+                0,
+                region_end
+                - max_samples,
+            )
+
+    speech_audio = audio_int16[
+        region_start:
+        region_end
+    ]
+
+    return (
+        speech_audio,
+        region_start / INPUT_RATE,
+        region_end / INPUT_RATE,
+        noise_floor,
+        threshold,
+    )
+
+
+def speaker_similarity_speech_aware(
+    recognizer,
+    enrolled_embedding,
+    audio_int16,
+):
+    (
+        speech_audio,
+        speech_start,
+        speech_end,
+        noise_floor,
+        threshold,
+    ) = extract_speech_region(
+        audio_int16
+    )
+
+    score = speaker_similarity(
+        recognizer,
+        enrolled_embedding,
+        speech_audio,
+    )
+
+    # A very short region (one word, or the trimmer finding little
+    # above the noise gate) gives a weak embedding. Score the whole
+    # window too and keep the better result.
+    if (
+        speech_end - speech_start
+        < SPEAKER_VAD_FALLBACK_SECONDS
+        and len(audio_int16) > len(speech_audio)
+    ):
+        score = max(
+            score,
+            speaker_similarity(
+                recognizer,
+                enrolled_embedding,
+                audio_int16,
+            ),
+        )
+
+    return (
+        score,
+        speech_start,
+        speech_end,
+        noise_floor,
+        threshold,
     )
 
 
@@ -3723,6 +4148,7 @@ class NexusController:
         self.wake_cooldown_until = 0.0
         self.response_active = False
         self.speech_started_seen = False
+        self.speech_start_block_index = None
 
         # Streaming playback bookkeeping.
         self.player = None
@@ -3741,6 +4167,7 @@ class NexusController:
         self.active_origin = origin
         self.verification_pending = verification_pending
         self.speech_started_seen = False
+        self.speech_start_block_index = None
         self.recent_blocks.clear()
 
         if timeout is None:
@@ -3763,6 +4190,7 @@ class NexusController:
         self.verify_blocks = []
         self.pending_send_blocks = []
         self.speech_started_seen = False
+        self.speech_start_block_index = None
 
         if SPEAKER_VERIFY_MODE == "strict":
             self.followup_blocks.clear()
@@ -3820,6 +4248,7 @@ class NexusController:
         self.recent_blocks.clear()
         self.verification_pending = False
         self.speech_started_seen = False
+        self.speech_start_block_index = None
 
         wake_preroll.clear()
         clear_mic_queue()
@@ -3858,11 +4287,18 @@ class NexusController:
     ):
         self._clear_buffers()
 
+        cooldown = WAKE_RESUME_COOLDOWN_SECONDS
+
         if rejected:
-            self.wake_cooldown_until = (
-                time.monotonic()
-                + WAKE_REJECT_COOLDOWN_SECONDS
+            cooldown = max(
+                cooldown,
+                WAKE_REJECT_COOLDOWN_SECONDS,
             )
+
+        self.wake_cooldown_until = (
+            time.monotonic()
+            + cooldown
+        )
 
         self.state = (
             AssistantState.WAIT_WAKE
@@ -3887,20 +4323,46 @@ async def score_speaker(
         select_channel_blocks(blocks, 1)
     )
 
-    return await asyncio.gather(
+    if not SPEAKER_SPEECH_AWARE:
+        return await asyncio.gather(
+            asyncio.to_thread(
+                speaker_similarity,
+                controller.recognizer,
+                controller.enrolled_embeddings[0],
+                audio0,
+            ),
+            asyncio.to_thread(
+                speaker_similarity,
+                controller.recognizer,
+                controller.enrolled_embeddings[1],
+                audio1,
+            ),
+        )
+
+    result0, result1 = await asyncio.gather(
         asyncio.to_thread(
-            speaker_similarity,
+            speaker_similarity_speech_aware,
             controller.recognizer,
             controller.enrolled_embeddings[0],
             audio0,
         ),
         asyncio.to_thread(
-            speaker_similarity,
+            speaker_similarity_speech_aware,
             controller.recognizer,
             controller.enrolled_embeddings[1],
             audio1,
         ),
     )
+
+    print(
+        f"Speech region CH0: "
+        f"{result0[1]:.2f}-{result0[2]:.2f}s "
+        f"noise={result0[3]:.1f} gate={result0[4]:.1f}   "
+        f"CH1: {result1[1]:.2f}-{result1[2]:.2f}s "
+        f"noise={result1[3]:.1f} gate={result1[4]:.1f}"
+    )
+
+    return result0[0], result1[0]
 
 
 async def reject_current_speaker(
@@ -4018,12 +4480,8 @@ async def process_microphone(
                 block
             )
 
-            if (
-                time.monotonic()
-                < controller.wake_cooldown_until
-            ):
-                continue
-
+            # Always score so the models' buffers move past the
+            # previous phrase; only act outside the cooldown.
             score0 = get_wake_score(
                 wake_model_ch0,
                 ch0,
@@ -4033,6 +4491,12 @@ async def process_microphone(
                 wake_model_ch1,
                 ch1,
             )
+
+            if (
+                time.monotonic()
+                < controller.wake_cooldown_until
+            ):
+                continue
 
             best_score = max(
                 score0,
@@ -4242,9 +4706,21 @@ async def process_microphone(
                         block
                     )
 
-                if blocks_have_seconds(
-                    controller.verify_blocks,
-                    SOFT_VERIFY_SECONDS,
+                speech_index = (
+                    controller.speech_start_block_index
+                )
+
+                if (
+                    controller.speech_started_seen
+                    and speech_index is not None
+                    and blocks_have_seconds(
+                        controller.verify_blocks,
+                        SOFT_VERIFY_SECONDS,
+                    )
+                    and blocks_have_seconds(
+                        controller.verify_blocks[speech_index:],
+                        SOFT_VERIFY_SPEECH_SECONDS,
+                    )
                 ):
                     accepted = await verify_speaker(
                         ws,
@@ -4430,6 +4906,11 @@ async def receive_events(
                         (b[0].copy(), b[1].copy())
                         for b in controller.recent_blocks
                     ]
+
+                if controller.verification_pending:
+                    controller.speech_start_block_index = len(
+                        controller.verify_blocks
+                    )
 
                 print()
 
