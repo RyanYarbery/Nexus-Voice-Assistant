@@ -195,6 +195,8 @@ The remaining gap to an Echo-class device is mostly outside the software:
 
 ### Future improvements
 
+Parked feature work (web search, out-of-credit alert) is in [docs/FUTURE.md](docs/FUTURE.md).
+
 - Split the single-file prototype into testable modules
 - Convert the scripts in `tests/` to pytest and add connection-manager coverage
 - Add a LICENSE file
