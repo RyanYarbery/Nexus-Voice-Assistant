@@ -378,6 +378,14 @@ ALARM_BEEP_GAP = 0.20
 ALARM_BEEP_COUNT = env_int("NEXUS_ALARM_BEEP_COUNT", 16, "Beeps when an alarm goes off.")
 ALARM_VOLUME = env_float("NEXUS_ALARM_VOLUME", 0.30, "Alarm beep volume, 0 to 1.")
 
+# --- Time limits on every waiting state -----------------------------
+
+REPLY_TIMEOUT_SECONDS = env_float(
+    "NEXUS_REPLY_TIMEOUT_SECONDS",
+    15,
+    "Give up on a reply if no audio has arrived this long after asking (0 = wait for ever).",
+)
+
 # --- Failing loudly -------------------------------------------------
 
 OFFLINE_NOTICES = env_flag(
@@ -3746,6 +3754,9 @@ class NexusController:
         self.speech_started_seen = False
         self.speech_start_block_index = None
 
+        # When the reply being waited for is given up on (0 = no limit running).
+        self.reply_deadline = 0.0
+
         self.wake_gate = WakeGate()
         self.link = Link()
         self.was_speaking = False
@@ -3837,6 +3848,7 @@ class NexusController:
         self.pending_input_clear = False
         self.wait_blocks.clear()
         self.recent_blocks.clear()
+        self.reply_deadline = 0.0
         self.verification_pending = False
         self.speech_started_seen = False
         self.speech_start_block_index = None
@@ -3889,6 +3901,43 @@ class NexusController:
         print()
 
         print('Waiting for "Hey Nexus"...')
+
+
+def start_reply_clock(controller):
+    """Called whenever a reply has just been asked for."""
+    if REPLY_TIMEOUT_SECONDS > 0:
+        controller.reply_deadline = time.monotonic() + REPLY_TIMEOUT_SECONDS
+    else:
+        controller.reply_deadline = 0.0
+
+
+_background_tasks = set()
+
+
+def run_in_background(coroutine):
+    task = asyncio.create_task(coroutine)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+async def give_up_on_reply(ws, controller, reason):
+    """The reply is not coming: stop waiting, say so, listen for the wake phrase again."""
+    print(f"Giving up on the reply: {reason}.")
+
+    if controller.response_active:
+        if controller.current_response_id:
+            controller.cancelled_response_id = controller.current_response_id
+
+        try:
+            await ws.send(json.dumps({"type": "response.cancel"}))
+        except Exception:
+            pass
+
+    controller.response_active = False
+    controller.return_to_wake()
+
+    run_in_background(play_notice("error"))
 
 
 async def score_speaker(
@@ -4308,6 +4357,14 @@ async def handle_microphone_block(
         return
 
     if controller.state == AssistantState.WAIT_RESPONSE:
+        if (
+            controller.reply_deadline
+            and controller.player is None
+            and time.monotonic() >= controller.reply_deadline
+        ):
+            await give_up_on_reply(ws, controller, "no audio arrived in time")
+            return
+
         # Kept so speech right after a barge-in is not lost.
         controller.wait_blocks.append(block)
         return
@@ -4460,6 +4517,8 @@ async def receive_events(
 
                 await create_response(ws)
 
+                start_reply_clock(controller)
+
         elif event_type == "response.created":
             response_audio.clear()
 
@@ -4470,6 +4529,8 @@ async def receive_events(
 
             if not delta:
                 continue
+
+            controller.reply_deadline = 0.0
 
             if not STREAMING_PLAYBACK:
                 response_audio.extend(base64.b64decode(delta))
@@ -4580,6 +4641,8 @@ async def receive_events(
 
                 controller.response_active = True
 
+                start_reply_clock(controller)
+
                 continue
 
             controller.response_active = False
@@ -4668,6 +4731,19 @@ async def receive_events(
                 # The server usually closes the socket next; make sure
                 # that close is treated as an account problem.
                 controller.link.last_error_kind = error_kind
+
+            error_code = str(error.get("code", ""))
+
+            if error_code == "response_cancel_not_active" or "no active response" in error_message.lower():
+                # Our own cancel arrived after the reply had ended. Harmless.
+                continue
+
+            if controller.state == AssistantState.WAIT_RESPONSE and controller.player is None:
+                # The request failed. Without this Nexus would wait for
+                # audio that never comes until the session ended.
+                controller.response_active = False
+                await give_up_on_reply(ws, controller, "the service reported an error")
+                continue
 
             controller.response_active = False
 
