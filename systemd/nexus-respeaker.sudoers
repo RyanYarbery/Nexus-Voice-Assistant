@@ -1,0 +1,9 @@
+# Installed as /etc/sudoers.d/nexus-respeaker (root:root 440, check with visudo -cf).
+ryan ALL=(root) NOPASSWD: /usr/local/bin/nexus-respeaker-route barge-on
+ryan ALL=(root) NOPASSWD: /usr/local/bin/nexus-respeaker-route barge-off
+ryan ALL=(root) NOPASSWD: /usr/local/bin/nexus-respeaker-route status
+# Added 2026-11-19 for the wake-word recording session (tools/wake_record.py):
+ryan ALL=(root) NOPASSWD: /usr/local/bin/nexus-respeaker-route asr-on
+ryan ALL=(root) NOPASSWD: /usr/local/bin/nexus-respeaker-route asr-off
+ryan ALL=(root) NOPASSWD: /usr/bin/systemctl stop nexus.service
+ryan ALL=(root) NOPASSWD: /usr/bin/systemctl start nexus.service

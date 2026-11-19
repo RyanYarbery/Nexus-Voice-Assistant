@@ -1,0 +1,55 @@
+#!/bin/bash
+# Root-owned helper that sets up the ReSpeaker XVF3800 for Nexus.
+# Installed as /usr/local/bin/nexus-respeaker-route (root:root 755); ryan may run
+# it through sudo -n (see nexus-respeaker.sudoers).
+#
+# It runs a ROOT-OWNED copy of xvf_host in /usr/local/lib/nexus/xvf_host/, never
+# the one under ~/echo: a file ryan can overwrite must never run as root
+# (review 2026-11-18, item B12). Refresh the copy with:
+#   sudo install -o root -g root -m 755 <sdk>/xvf_host          /usr/local/lib/nexus/xvf_host/
+#   sudo install -o root -g root -m 644 <sdk>/*.so <sdk>/*.yaml  /usr/local/lib/nexus/xvf_host/
+#
+# CH1 (right) = AEC residual 3 with the chip's ASR output on: the beam after echo
+# cancelling, without the comms noise suppression. XMOS provides it for wake-word
+# engines. Set at every boot and every Nexus start because the chip may forget it
+# on power loss. (Wake-word report 2026-11-18, section 3; ~/Work/Nexus/STATUS.md.)
+
+set -u
+XVF=/usr/local/lib/nexus/xvf_host/xvf_host
+
+asr_route() {
+    "$XVF" AUDIO_MGR_OP_R 7 3 && "$XVF" AEC_ASROUTONOFF 1
+}
+
+case "${1:-}" in
+    boot)
+        # Run once before nexus.service (nexus-respeaker.service).
+        for _ in $(seq 1 15); do
+            "$XVF" PP_MIN_NN 0.30 && asr_route && exit 0
+            echo "ReSpeaker not ready yet - retrying..."
+            sleep 2
+        done
+        exit 1
+        ;;
+
+    # barge-on/barge-off are kept for echo.py, which calls barge-off at start.
+    # Both set the same route since 2026-09-04.
+    barge-on|barge-off|asr-on)
+        asr_route
+        ;;
+
+    # Only for wake-recording round 2b (tools/wake_record.py), which turns it back on.
+    asr-off)
+        "$XVF" AUDIO_MGR_OP_R 7 3 && "$XVF" AEC_ASROUTONOFF 0
+        ;;
+
+    status)
+        "$XVF" AUDIO_MGR_OP_R
+        "$XVF" AEC_ASROUTONOFF
+        ;;
+
+    *)
+        echo "Usage: $0 {boot|barge-on|barge-off|asr-on|asr-off|status}"
+        exit 1
+        ;;
+esac
