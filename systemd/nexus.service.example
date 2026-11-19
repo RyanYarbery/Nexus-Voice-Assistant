@@ -4,7 +4,14 @@ Wants=network-online.target
 After=network-online.target sound.target
 
 [Service]
-Type=simple
+# Nexus tells systemd when it is ready and then pings it from the
+# microphone loop. If the loop freezes or the microphone dies, the pings
+# stop and systemd restarts the service. Loading the models from a slow
+# disk can take minutes, hence the long start timeout.
+Type=notify
+NotifyAccess=main
+WatchdogSec=60
+TimeoutStartSec=900
 User=YOUR_USER
 Group=YOUR_USER
 WorkingDirectory=/home/YOUR_USER/nexus-voice-assistant

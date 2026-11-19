@@ -8,6 +8,7 @@ import json
 import math
 import queue
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -404,6 +405,12 @@ SPEAKER_FAIL_LIMIT = env_int(
     "Failed replies in a row before the speaker is reported broken and Nexus restarts (0 = never).",
 )
 
+MIC_STALL_SECONDS = env_float(
+    "NEXUS_MIC_STALL_SECONDS",
+    10,
+    "Restart if the microphone delivers no audio for this long (0 = never).",
+)
+
 # --- Failing loudly -------------------------------------------------
 
 OFFLINE_NOTICES = env_flag(
@@ -439,6 +446,7 @@ STATUS_OK_AFTER_SECONDS = env_float(
     "NEXUS_STATUS_OK_AFTER_SECONDS", 5, "A connection counts as healthy once it has lasted this long."
 )
 STATUS_HEARTBEAT_SECONDS = 60
+WATCHDOG_PING_SECONDS = 10
 
 _status_file = env_str(
     "NEXUS_STATUS_FILE",
@@ -1092,12 +1100,68 @@ def set_status(state, problem=None, detail=""):
 
     write_status_file()
 
+    sd_notify(f"STATUS={status_summary()}")
+
 
 async def status_heartbeat():
     """Rewrite the status file every minute so a stale file means a hung process."""
     while True:
         write_status_file()
         await asyncio.sleep(STATUS_HEARTBEAT_SECONDS)
+
+
+def sd_notify(message):
+    """Tell systemd something (READY=1, WATCHDOG=1, STATUS=...).
+
+    Does nothing unless systemd started the process with a notify socket
+    (Type=notify or WatchdogSec= in the unit).
+    """
+    address = os.environ.get("NOTIFY_SOCKET")
+
+    if not address:
+        return False
+
+    if address.startswith("@"):
+        address = "\0" + address[1:]
+
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notify_socket:
+            notify_socket.sendto(message.encode("utf-8"), address)
+
+        return True
+    except OSError:
+        return False
+
+
+# Time of the last microphone block, and of the last overflow message.
+mic_health = {"last_block": time.monotonic(), "last_status_print": 0.0, "last_watchdog_ping": 0.0}
+
+
+async def microphone_watchdog():
+    """Exit when the microphone stream has died.
+
+    A USB microphone that drops off the bus and comes back leaves a dead
+    stream behind: the service looks healthy and hears nothing. A fresh
+    process reopens the device.
+    """
+    if MIC_STALL_SECONDS <= 0:
+        await asyncio.Event().wait()  # switched off: idle for ever
+
+    mic_health["last_block"] = time.monotonic()
+
+    while True:
+        await asyncio.sleep(min(1.0, MIC_STALL_SECONDS / 2))
+
+        silent_for = time.monotonic() - mic_health["last_block"]
+
+        if silent_for >= MIC_STALL_SECONDS:
+            set_status(
+                "problem",
+                "microphone",
+                f"no audio from the microphone for {silent_for:.0f} s",
+            )
+            hard_exit("the microphone stream stopped")
+            return
 
 
 def hard_exit(reason):
@@ -1326,7 +1390,14 @@ def microphone_callback(
     time_info,
     status,
 ):
-    if status:
+    now = time.monotonic()
+
+    mic_health["last_block"] = now
+
+    if status and now - mic_health["last_status_print"] >= 10.0:
+        # At most one line per 10 s: under CPU pressure this fires on
+        # every callback and would flood the log.
+        mic_health["last_status_print"] = now
         print(f"Microphone status: {status}")
 
     ch0 = indata[:, 0].copy().astype(np.int16)
@@ -4175,6 +4246,14 @@ async def process_microphone(
     while True:
         block = await queue_get(mic_queue)
 
+        now = time.monotonic()
+
+        if now - mic_health["last_watchdog_ping"] >= WATCHDOG_PING_SECONDS:
+            # Fed from here, so a frozen loop or a dead microphone both
+            # stop the pings and systemd restarts the service.
+            mic_health["last_watchdog_ping"] = now
+            sd_notify("WATCHDOG=1")
+
         try:
             await handle_microphone_block(
                 link,
@@ -5481,6 +5560,7 @@ async def main():
             )
         ),
         asyncio.create_task(status_heartbeat()),
+        asyncio.create_task(microphone_watchdog()),
         asyncio.create_task(
             connection_manager(
                 api_key,
@@ -5492,7 +5572,11 @@ async def main():
     print()
     print('Waiting for "Hey Nexus"...')
 
+    sd_notify("READY=1")
+
     try:
+        # None of these should ever finish; if one does, stop so the
+        # service manager restarts the whole process.
         done, pending = await asyncio.wait(
             tasks,
             return_when=asyncio.FIRST_COMPLETED,
