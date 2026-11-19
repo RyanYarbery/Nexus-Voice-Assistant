@@ -132,8 +132,15 @@ def settings_markdown():
         lines.append("|---|---|---|")
 
         for entry in sorted((e for e in ALL_SETTINGS if e["group"] == group_name), key=lambda e: e["name"]):
-            default = str(entry["default"]).replace(home, "$NEXUS_HOME")
-            default = f"`{default}`" if default != "" else "(empty)"
+            if entry["name"] == "NEXUS_HOME":
+                default = "the folder Nexus is installed in"
+            elif isinstance(entry["default"], bool):
+                default = "`1`" if entry["default"] else "`0`"
+            elif entry["default"] == "":
+                default = "(empty)"
+            else:
+                default = "`" + str(entry["default"]).replace(home, "$NEXUS_HOME") + "`"
+
             lines.append(f"| `{entry['name']}` | {default} | {entry['doc']} |")
 
         lines.append("")

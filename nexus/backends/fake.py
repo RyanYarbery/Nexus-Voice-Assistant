@@ -1,6 +1,9 @@
-"""A voice service that answers every request with one second of silence (NEXUS_BACKEND=fake).
+"""A stand-in voice service (NEXUS_BACKEND=fake).
 
-For trying the whole loop with no account and no network, and for tests.
+It "hears speech" in the first half second of audio it is sent after each
+clear, and answers every request with one second of silence. That is enough
+to run the whole loop (wake, request, reply, follow-up) with no account and
+no network, and for tests.
 """
 
 import asyncio
@@ -18,6 +21,8 @@ class FakeSession(VoiceSession):
         self.queue = asyncio.Queue()
         self.calls = []
         self.replies = 0
+        self._heard = 0
+        self._speech = "none"
 
     async def configure(self, instructions, tools):
         self.calls.append(("configure", len(tools)))
@@ -25,9 +30,19 @@ class FakeSession(VoiceSession):
 
     async def send_audio(self, pcm):
         self.calls.append(("send_audio", len(pcm)))
+        self._heard += len(pcm)
+
+        if self._speech == "none":
+            self._speech = "started"
+            self.queue.put_nowait({"type": "speech_started"})
+        elif self._speech == "started" and self._heard >= 8000:
+            self._speech = "stopped"
+            self.queue.put_nowait({"type": "speech_stopped"})
 
     async def clear_input(self):
         self.calls.append(("clear_input",))
+        self._heard = 0
+        self._speech = "none"
 
     async def request_reply(self):
         self.calls.append(("request_reply",))
