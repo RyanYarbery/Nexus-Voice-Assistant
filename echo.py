@@ -392,6 +392,12 @@ REQUEST_MAX_SECONDS = env_float(
     "Longest one spoken request may last before it is dropped (0 = no limit).",
 )
 
+PLAYER_STALL_SECONDS = env_float(
+    "NEXUS_PLAYER_STALL_SECONDS",
+    10,
+    "Stop a reply's playback after this long with no audio arriving (0 = no limit).",
+)
+
 # --- Failing loudly -------------------------------------------------
 
 OFFLINE_NOTICES = env_flag(
@@ -3435,6 +3441,10 @@ class ResponsePlayer:
         self.underruns = 0
         self.task = None
 
+        # False for a spoken lead-in before a tool call: the real answer
+        # is still to come, so no follow-up window opens after it.
+        self.followup = True
+
     def feed(self, pcm_bytes):
         if pcm_bytes:
             self.queue.put(np.frombuffer(pcm_bytes, dtype=np.int16))
@@ -3494,6 +3504,7 @@ class ResponsePlayer:
         pending48 = np.zeros(0, dtype=np.int16)
         pending16 = np.zeros(0, dtype=np.int16)
         done = False
+        starved_since = None
 
         audible = None
         own_reference = None
@@ -3576,7 +3587,16 @@ class ResponsePlayer:
 
                     # Generation has fallen behind real time. Keep the
                     # streams alive with silence rather than let ALSA
-                    # underrun.
+                    # underrun, but not for ever: a reply whose end never
+                    # arrives must let go of the speaker.
+                    now = time.monotonic()
+
+                    if starved_since is None:
+                        starved_since = now
+                    elif PLAYER_STALL_SECONDS > 0 and now - starved_since >= PLAYER_STALL_SECONDS:
+                        print(f"No audio for {PLAYER_STALL_SECONDS:g} s; ending playback.", flush=True)
+                        break
+
                     self.underruns += 1
                     chunk48 = np.zeros(chunk_frames, dtype=np.int16)
                     chunk16 = np.zeros(
@@ -3584,6 +3604,7 @@ class ResponsePlayer:
                         dtype=np.int16,
                     )
                 else:
+                    starved_since = None
                     n = min(chunk_frames, len(pending48))
                     chunk48 = pending48[:n]
                     pending48 = pending48[n:]
@@ -3683,19 +3704,37 @@ async def run_player(
         if controller.player is player:
             controller.player = None
 
-    if interrupted and controller.response_active and controller.current_response_id == player.response_id:
-        # The server is still generating this reply. Stop it so no
-        # more audio arrives for a response nobody is listening to.
-        controller.cancelled_response_id = player.response_id
+    if interrupted and controller.response_active:
+        if controller.current_response_id == player.response_id and player.followup:
+            # The server is still generating this reply. Stop it so no
+            # more audio arrives for a response nobody is listening to.
+            controller.cancelled_response_id = player.response_id
 
-        try:
-            await ws.send(json.dumps({"type": "response.cancel"}))
-        except Exception:
-            pass
+            try:
+                await ws.send(json.dumps({"type": "response.cancel"}))
+            except Exception:
+                pass
+
+        elif not player.followup:
+            # A lead-in was interrupted; the answer that follows it must
+            # not start playing over the new request.
+            if controller.current_response_id != player.response_id:
+                controller.cancelled_response_id = controller.current_response_id
+
+                try:
+                    await ws.send(json.dumps({"type": "response.cancel"}))
+                except Exception:
+                    pass
+            else:
+                controller.cancel_next_response = True
 
         # The cancel is on its way; a new request must not have to wait
         # for the server to confirm it.
         controller.response_active = False
+
+    if not player.followup and not interrupted:
+        # Lead-in finished; keep waiting for the answer.
+        return
 
     await open_followup(
         ws,
@@ -3785,6 +3824,7 @@ class NexusController:
         self.player = None
         self.current_response_id = None
         self.cancelled_response_id = None
+        self.cancel_next_response = False
 
     def enter_active(
         self,
@@ -3884,6 +3924,7 @@ class NexusController:
         self.response_active = False
         self.current_response_id = None
         self.cancelled_response_id = None
+        self.cancel_next_response = False
         self.followup_deadline = 0.0
         self.active_deadline = 0.0
         self.wake_cooldown_until = 0.0
@@ -4555,6 +4596,13 @@ async def receive_events(
 
             controller.current_response_id = message.get("response", {}).get("id")
 
+            if controller.cancel_next_response:
+                controller.cancel_next_response = False
+                controller.cancelled_response_id = controller.current_response_id
+                controller.response_active = False
+
+                await ws.send(json.dumps({"type": "response.cancel"}))
+
         elif event_type == "response.output_audio.delta":
             delta = message.get("delta")
 
@@ -4639,6 +4687,15 @@ async def receive_events(
 
             if function_calls:
                 response_audio.clear()
+
+                player = controller.player
+
+                if player is not None and player.response_id == response_id:
+                    # The model said something ("one moment") before
+                    # calling the tool. Let it finish and let go of the
+                    # speaker; the follow-up window belongs to the answer.
+                    player.followup = False
+                    player.finish()
 
                 for item in function_calls:
                     name = item.get("name")

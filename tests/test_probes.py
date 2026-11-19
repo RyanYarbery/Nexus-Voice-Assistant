@@ -206,3 +206,46 @@ def test_g_request_that_ends_before_the_cancel_is_confirmed_still_gets_a_reply()
         assert ws.types().count("response.create") == 2
 
     scenario(body)
+
+
+def test_a_reply_whose_end_never_arrives_lets_go_of_the_speaker():
+    async def body(ws, c):
+        await h.to_wait_response(ws, c)
+        ws.push({"type": "response.created", "response": {"id": "r1"}})
+        ws.push({"type": "response.output_audio.delta", "response_id": "r1", "delta": b64(0.2)})
+        await wait_for(h.speaking, what="speaking")
+        await wait_for(lambda: not h.speaking(), timeout=3.0, what="playback to give up")
+        assert not h.speaker_lock_held()
+
+    with h.setting(PLAYER_STALL_SECONDS=0.3):
+        scenario(body)
+
+
+def test_a_interrupted_lead_in_drops_the_answer_that_follows():
+    async def body(ws, c):
+        await h.to_wait_response(ws, c)
+        ws.push({"type": "response.created", "response": {"id": "r1"}})
+        ws.push({"type": "response.output_audio.delta", "response_id": "r1", "delta": b64(2.0)})
+        await wait_for(h.speaking, what="speaking")
+        ws.push(
+            {
+                "type": "response.done",
+                "response": {
+                    "id": "r1",
+                    "status": "completed",
+                    "output": [
+                        {"type": "function_call", "name": "list_timers", "call_id": "c1", "arguments": "{}"}
+                    ],
+                },
+            }
+        )
+        await asyncio.sleep(0.1)
+        h.fire_barge()
+        await wait_for(lambda: c.state == A.ACTIVE and c.active_origin == "interrupt", what="interrupt")
+        ws.push({"type": "response.created", "response": {"id": "r2"}})
+        ws.push({"type": "response.output_audio.delta", "response_id": "r2", "delta": b64(0.5)})
+        await asyncio.sleep(0.2)
+        assert "response.cancel" in ws.types()
+        assert not h.speaking() and c.player is None, "the answer played over the new request"
+
+    scenario(body)
