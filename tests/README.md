@@ -1,16 +1,18 @@
 # Tests
 
-Both suites run without a microphone, speakers, OpenAI, or the ML models.
+The tests run without a microphone, speakers, OpenAI, or the ML models.
 
 ```bash
-python -m venv .venv-test && .venv-test/bin/pip install numpy scipy
-.venv-test/bin/python tests/test_units.py     # resampler, timers, helpers
-.venv-test/bin/python tests/test_flow.py      # state machine end to end
+python -m venv .venv-test && .venv-test/bin/pip install numpy scipy pytest
+.venv-test/bin/python -m pytest tests
 ```
 
-`test_flow.py` loads `echo.py` with `sounddevice`, `torch`, `websockets`,
-`openwakeword`, and `speechbrain` replaced by stubs, then drives the
-controller with scripted microphone blocks and Realtime events. It
-covers soft and strict speaker verification, streaming and buffered
-playback, barge-in with server-side `response.cancel`, speaker
-rejection, and the follow-up window.
+`harness.py` loads the assistant with `sounddevice`, `torch`, `websockets`,
+`openwakeword`, and `speechbrain` replaced by stubs, then drives it with
+scripted microphone blocks and scripted Realtime events.
+
+- `test_units.py`: resampling, timers and small helpers.
+- `test_flow.py`: wake, speaker check, streaming and buffered playback,
+  barge-in, rejection and the follow-up window.
+- `test_probes.py`: failure paths (errors, timeouts, a failing speaker, beeps
+  during a request, a stray sound in the follow-up window).
