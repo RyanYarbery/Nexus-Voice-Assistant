@@ -386,6 +386,12 @@ REPLY_TIMEOUT_SECONDS = env_float(
     "Give up on a reply if no audio has arrived this long after asking (0 = wait for ever).",
 )
 
+REQUEST_MAX_SECONDS = env_float(
+    "NEXUS_REQUEST_MAX_SECONDS",
+    30,
+    "Longest one spoken request may last before it is dropped (0 = no limit).",
+)
+
 # --- Failing loudly -------------------------------------------------
 
 OFFLINE_NOTICES = env_flag(
@@ -3687,6 +3693,10 @@ async def run_player(
         except Exception:
             pass
 
+        # The cancel is on its way; a new request must not have to wait
+        # for the server to confirm it.
+        controller.response_active = False
+
     await open_followup(
         ws,
         controller,
@@ -3752,6 +3762,7 @@ class NexusController:
         self.wake_cooldown_until = 0.0
         self.response_active = False
         self.speech_started_seen = False
+        self.speech_started_at = 0.0
         self.speech_start_block_index = None
 
         # When the reply being waited for is given up on (0 = no limit running).
@@ -4007,6 +4018,8 @@ async def reject_current_speaker(
             await ws.send(json.dumps({"type": "response.cancel"}))
         except Exception:
             pass
+
+        controller.response_active = False
 
     if controller.player is not None:
         controller.player.abort()
@@ -4301,6 +4314,23 @@ async def handle_microphone_block(
             controller.return_to_wake()
             return
 
+        if (
+            REQUEST_MAX_SECONDS > 0
+            and controller.speech_started_seen
+            and time.monotonic() - controller.speech_started_at >= REQUEST_MAX_SECONDS
+        ):
+            # A television or steady noise can keep the server's speech
+            # detector "on" for ever. Stop sending the room to it.
+            print(f"Request ran past {REQUEST_MAX_SECONDS:g} s without a pause; dropping it.")
+
+            try:
+                await clear_openai_input(ws)
+            except Exception:
+                pass
+
+            controller.return_to_wake()
+            return
+
         if controller.pending_input_clear:
             controller.pending_input_clear = False
             await clear_openai_input(ws)
@@ -4474,6 +4504,7 @@ async def receive_events(
         elif event_type == "input_audio_buffer.speech_started":
             if controller.state == AssistantState.ACTIVE:
                 controller.speech_started_seen = True
+                controller.speech_started_at = time.monotonic()
 
                 # Soft follow-up: judge the speaker from just before
                 # the server noticed speech, not from the silence
@@ -4594,6 +4625,16 @@ async def receive_events(
                 [],
             )
 
+            if response_id is not None and response_id == controller.cancelled_response_id:
+                # Cancelled after a barge-in or speaker rejection. Whoever
+                # cancelled it has already moved the state on, and a newer
+                # request may be running, so leave everything else alone.
+                controller.cancelled_response_id = None
+
+                print("Response status: cancelled")
+
+                continue
+
             function_calls = [item for item in output if (item.get("type") == "function_call")]
 
             if function_calls:
@@ -4654,12 +4695,6 @@ async def receive_events(
                     "Response status:",
                     status,
                 )
-
-            if response_id is not None and response_id == controller.cancelled_response_id:
-                # Cancelled after a barge-in or speaker rejection;
-                # whoever cancelled it has already moved the state on.
-                controller.cancelled_response_id = None
-                continue
 
             player = controller.player
 
