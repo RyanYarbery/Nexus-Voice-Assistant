@@ -3,10 +3,11 @@
 Each test describes behaviour the assistant must have. All seven failed on
 the code as reviewed (commit 952e9a2).
 """
+
 import asyncio
 
 import harness as h
-from harness import A, b64, feed_mic, ns, scenario, script, wait_for, written
+from harness import A, b64, feed_mic, ns, scenario, script, wait_for
 
 
 def test_a_spoken_lead_in_before_a_tool_call_does_not_jam_the_speaker():
@@ -20,7 +21,9 @@ def test_a_spoken_lead_in_before_a_tool_call_does_not_jam_the_speaker():
                 "response": {
                     "id": "r1",
                     "status": "completed",
-                    "output": [{"type": "function_call", "name": "list_timers", "call_id": "c1", "arguments": "{}"}],
+                    "output": [
+                        {"type": "function_call", "name": "list_timers", "call_id": "c1", "arguments": "{}"}
+                    ],
                 },
             }
         )

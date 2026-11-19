@@ -203,9 +203,27 @@ WAKE_REJECT_COOLDOWN_SECONDS = env_float(
 # feature buffers still end with the last wake phrase when listening
 # resumes. Keep scoring (to flush them) but ignore detections for this
 # long after every return to wake, or the old phrase fires again.
-WAKE_RESUME_COOLDOWN_SECONDS = env_float(
-    "NEXUS_WAKE_RESUME_COOLDOWN_SECONDS", 2.0, "Wake word ignored for this long after each exchange."
+WAKE_ALWAYS_SCORE = env_flag(
+    "NEXUS_WAKE_ALWAYS_SCORE",
+    True,
+    "Feed the wake models every microphone block in every state (0 = only while waiting or speaking).",
 )
+
+# With WAKE_ALWAYS_SCORE the models hear the whole exchange, so the old
+# phrase has left their memory by the time listening resumes and only a
+# short guard is needed. Without it they still end with the last wake
+# phrase, and detections are ignored for 2 s after every return to wake.
+WAKE_RESUME_COOLDOWN_SECONDS = env_float(
+    "NEXUS_WAKE_RESUME_COOLDOWN_SECONDS",
+    0.3 if WAKE_ALWAYS_SCORE else 2.0,
+    "Wake word ignored for this long after each exchange.",
+)
+
+# After a wake word is acted on, the next one is accepted only once the
+# score has stayed below this fraction of the threshold for this many
+# blocks (80 ms each). One spoken phrase can therefore never fire twice.
+WAKE_REARM_FRACTION = 0.5
+WAKE_REARM_BLOCKS = 3
 
 # When the speech-aware trimmer finds less than this much speech, the
 # untrimmed window is scored as well and the better score is used.
@@ -423,8 +441,6 @@ def code_version():
 # =========================================================
 
 mic_queue = queue.Queue(maxsize=250)
-
-barge_queue = queue.Queue(maxsize=100)
 
 assistant_speaking = threading.Event()
 barge_in_event = threading.Event()
@@ -698,15 +714,6 @@ def clear_mic_queue():
             break
 
 
-def clear_barge_queue():
-    while True:
-        try:
-            barge_queue.get_nowait()
-
-        except queue.Empty:
-            break
-
-
 def open_input_stream():
     global input_stream
 
@@ -893,20 +900,21 @@ def microphone_callback(
         ch1,
     )
 
-    target_queue = barge_queue if assistant_speaking.is_set() else mic_queue
-
+    # One queue and one consumer for every state. The consumer scores
+    # each block for the wake phrase and decides from the state whether
+    # a hit means wake, barge-in or nothing.
     try:
-        target_queue.put_nowait(stereo_block)
+        mic_queue.put_nowait(stereo_block)
 
     except queue.Full:
         try:
-            target_queue.get_nowait()
+            mic_queue.get_nowait()
 
         except queue.Empty:
             pass
 
         try:
-            target_queue.put_nowait(stereo_block)
+            mic_queue.put_nowait(stereo_block)
 
         except queue.Full:
             pass
@@ -1322,7 +1330,6 @@ async def play_beeps(
         # audio keeps flowing to the barge-in monitor, which lets
         # "Hey Nexus" silence the beeps.
         barge_in_event.clear()
-        clear_barge_queue()
         assistant_speaking.set()
 
         try:
@@ -1345,7 +1352,6 @@ async def play_beeps(
             assistant_speaking.clear()
             barge_in_event.clear()
             clear_mic_queue()
-            clear_barge_queue()
 
 
 async def play_timer_alarm(
@@ -2647,86 +2653,77 @@ def reset_wake_detectors(
         reset_wake_detector(wake_model)
 
 
-async def monitor_barge_in(
-    barge_wake_models,
+class WakeGate:
+    """Stops one spoken wake phrase from firing twice.
+
+    A detection disarms the gate. It re-arms once the wake score has
+    stayed low for a few blocks, which means the phrase has left the
+    model's memory.
+    """
+
+    def __init__(self):
+        self.armed = True
+        self._quiet_blocks = 0
+
+    def disarm(self):
+        self.armed = False
+        self._quiet_blocks = 0
+
+    def observe(self, best_score):
+        if self.armed:
+            return
+
+        if best_score < min(WAKE_THRESHOLD, BARGE_WAKE_THRESHOLD) * WAKE_REARM_FRACTION:
+            self._quiet_blocks += 1
+
+            if self._quiet_blocks >= WAKE_REARM_BLOCKS:
+                self.armed = True
+        else:
+            self._quiet_blocks = 0
+
+
+def handle_block_while_speaking(
+    controller,
+    block,
+    score0,
+    score1,
 ):
-    reset_wake_detectors(barge_wake_models)
+    """Barge-in: called for every microphone block while Nexus is audible."""
+    controller.barge_peak0 = max(controller.barge_peak0, score0)
+    controller.barge_peak1 = max(controller.barge_peak1, score1)
+    controller.barge_debug_peak0 = max(controller.barge_debug_peak0, score0)
+    controller.barge_debug_peak1 = max(controller.barge_debug_peak1, score1)
 
-    peak0 = 0.0
-    peak1 = 0.0
-    last_print = time.monotonic()
+    now = time.monotonic()
 
-    while True:
-        block = await queue_get(barge_queue)
-
-        if not assistant_speaking.is_set():
-            peak0 = 0.0
-            peak1 = 0.0
-            last_print = time.monotonic()
-
-            reset_wake_detectors(barge_wake_models)
-            continue
-
-        ch0, ch1 = block
-
-        score0 = get_wake_score(
-            barge_wake_models[0],
-            ch0,
+    if BARGE_DEBUG and now - controller.barge_debug_printed >= BARGE_DEBUG_INTERVAL_SECONDS:
+        print(
+            f"BARGE DEBUG peak CH0(AEC)={controller.barge_debug_peak0:.3f} "
+            f"CH1(residual)={controller.barge_debug_peak1:.3f}",
+            flush=True,
         )
 
-        score1 = get_wake_score(
-            barge_wake_models[1],
-            ch1,
-        )
+        controller.barge_debug_peak0 = 0.0
+        controller.barge_debug_peak1 = 0.0
+        controller.barge_debug_printed = now
 
-        peak0 = max(
-            peak0,
-            score0,
-        )
+    if barge_in_event.is_set():
+        # Already interrupted; playback stops within one chunk. Keep
+        # what is said meanwhile so the new request loses nothing.
+        controller.wait_blocks.append(block)
+        return
 
-        peak1 = max(
-            peak1,
-            score1,
-        )
+    barge_score = {"ch0": score0, "ch1": score1, "best": max(score0, score1)}[BARGE_CHANNEL]
 
-        now = time.monotonic()
+    if controller.wake_gate.armed and barge_score >= BARGE_WAKE_THRESHOLD:
+        print()
+        print("*** HEY NEXUS INTERRUPT DETECTED ***")
 
-        if BARGE_DEBUG and now - last_print >= BARGE_DEBUG_INTERVAL_SECONDS:
-            print(
-                f"BARGE DEBUG peak CH0(AEC)={peak0:.3f} CH1(residual)={peak1:.3f}",
-                flush=True,
-            )
+        print(f"Interrupt wake CH0(AEC): {score0:.3f}   CH1(residual): {score1:.3f}")
 
-            peak0 = 0.0
-            peak1 = 0.0
-            last_print = now
+        controller.wake_gate.disarm()
 
-        # The controlled dual-output test measured 38.1 dB of
-        # echo reduction on CH0, versus only 2.4 dB on CH1.
-        # Trigger exclusively from the strongly cancelled CH0
-        # path so Nexus's own playback cannot dominate detection.
-        barge_score = {"ch0": score0, "ch1": score1, "best": max(score0, score1)}[BARGE_CHANNEL]
-
-        if assistant_speaking.is_set() and barge_score >= BARGE_WAKE_THRESHOLD:
-            print()
-            print("*** HEY NEXUS INTERRUPT DETECTED ***")
-
-            print(f"Interrupt wake CH0(AEC): {score0:.3f}   CH1(residual): {score1:.3f}")
-
-            barge_in_event.set()
-
-            clear_barge_queue()
-
-            reset_wake_detectors(barge_wake_models)
-
-            peak0 = 0.0
-            peak1 = 0.0
-            last_print = time.monotonic()
-
-            while assistant_speaking.is_set():
-                await asyncio.sleep(0.02)
-
-            continue
+        barge_in_event.set()
 
 
 # =========================================================
@@ -2845,7 +2842,6 @@ async def play_response_audio(
 
     async with playback_lock():
         barge_in_event.clear()
-        clear_barge_queue()
         clear_mic_queue()
         controller.wait_blocks.clear()
 
@@ -2983,7 +2979,6 @@ async def play_response_audio(
                     pass
 
             assistant_speaking.clear()
-            clear_barge_queue()
 
             # After a barge-in, keep what the user said next.
             if not interrupted:
@@ -3032,7 +3027,6 @@ class ResponsePlayer:
     async def run(self):
         async with playback_lock():
             barge_in_event.clear()
-            clear_barge_queue()
             clear_mic_queue()
             self.controller.wait_blocks.clear()
             assistant_speaking.set()
@@ -3042,7 +3036,6 @@ class ResponsePlayer:
 
             finally:
                 assistant_speaking.clear()
-                clear_barge_queue()
 
                 interrupted = self.interrupted or barge_in_event.is_set()
 
@@ -3341,6 +3334,16 @@ class NexusController:
         self.speech_started_seen = False
         self.speech_start_block_index = None
 
+        self.wake_gate = WakeGate()
+
+        # Highest wake scores heard while Nexus was audible: per reply
+        # (always logged) and per debug interval.
+        self.barge_peak0 = 0.0
+        self.barge_peak1 = 0.0
+        self.barge_debug_peak0 = 0.0
+        self.barge_debug_peak1 = 0.0
+        self.barge_debug_printed = 0.0
+
         # Streaming playback bookkeeping.
         self.player = None
         self.current_response_id = None
@@ -3606,19 +3609,42 @@ async def process_microphone(
 ):
     wake_model_ch0, wake_model_ch1 = wake_models
 
+    was_speaking = False
+
     while True:
         block = await queue_get(mic_queue)
 
-        if assistant_speaking.is_set():
-            continue
-
         ch0, ch1 = block
 
-        if controller.state == AssistantState.WAIT_WAKE:
-            wake_preroll.append(block)
+        speaking = assistant_speaking.is_set()
 
-            # Always score so the models' buffers move past the
-            # previous phrase; only act outside the cooldown.
+        if speaking != was_speaking:
+            was_speaking = speaking
+
+            if not WAKE_ALWAYS_SCORE:
+                # Old behaviour: the models are only fed while waiting
+                # or speaking, so clear their score history on a change.
+                reset_wake_detectors(wake_models)
+
+            if speaking:
+                controller.barge_peak0 = 0.0
+                controller.barge_peak1 = 0.0
+                controller.barge_debug_peak0 = 0.0
+                controller.barge_debug_peak1 = 0.0
+                controller.barge_debug_printed = time.monotonic()
+            else:
+                print(
+                    f"Barge-in peak while speaking: CH0={controller.barge_peak0:.3f} "
+                    f"CH1={controller.barge_peak1:.3f} (threshold {BARGE_WAKE_THRESHOLD}, {BARGE_CHANNEL})"
+                )
+
+        # The wake models hear every block in every state, so they never
+        # hold a stale phrase when listening resumes. What a hit means
+        # is decided below from the state.
+        score0 = 0.0
+        score1 = 0.0
+
+        if WAKE_ALWAYS_SCORE or speaking or controller.state == AssistantState.WAIT_WAKE:
             score0 = get_wake_score(
                 wake_model_ch0,
                 ch0,
@@ -3629,7 +3655,24 @@ async def process_microphone(
                 ch1,
             )
 
+            controller.wake_gate.observe(max(score0, score1))
+
+        if speaking:
+            handle_block_while_speaking(
+                controller,
+                block,
+                score0,
+                score1,
+            )
+            continue
+
+        if controller.state == AssistantState.WAIT_WAKE:
+            wake_preroll.append(block)
+
             if time.monotonic() < controller.wake_cooldown_until:
+                continue
+
+            if not controller.wake_gate.armed:
                 continue
 
             best_score = max(
@@ -3647,6 +3690,8 @@ async def process_microphone(
                 continue
 
             wake_winner = 0 if score0 >= score1 else 1
+
+            controller.wake_gate.disarm()
 
             print()
             print("*** HEY NEXUS DETECTED ***")
@@ -4486,7 +4531,6 @@ async def configure_session(
 async def run_connection(
     api_key,
     wake_models,
-    barge_wake_models,
     controller,
 ):
     url = f"wss://api.openai.com/v1/realtime?model={OPENAI_MODEL}"
@@ -4522,12 +4566,9 @@ async def run_connection(
             )
         )
 
-        barge_monitor = asyncio.create_task(monitor_barge_in(barge_wake_models))
-
         tasks = [
             processor,
             receiver,
-            barge_monitor,
         ]
 
         try:
@@ -4570,7 +4611,6 @@ async def run_connection(
 async def connection_manager(
     api_key,
     wake_models,
-    barge_wake_models,
     controller,
 ):
     delay = RECONNECT_INITIAL_SECONDS
@@ -4587,7 +4627,6 @@ async def connection_manager(
             await run_connection(
                 api_key,
                 wake_models,
-                barge_wake_models,
                 controller,
             )
 
@@ -4752,13 +4791,6 @@ async def main():
         WakeWordModel(wakeword_model_paths=[WAKE_MODEL_PATH]),
     )
 
-    print("Loading interruption wake-word models...")
-
-    barge_wake_models = (
-        WakeWordModel(wakeword_model_paths=[WAKE_MODEL_PATH]),
-        WakeWordModel(wakeword_model_paths=[WAKE_MODEL_PATH]),
-    )
-
     (
         recognizer,
         enrolled_ch0,
@@ -4789,7 +4821,6 @@ async def main():
         await connection_manager(
             api_key,
             wake_models,
-            barge_wake_models,
             controller,
         )
 

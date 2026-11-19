@@ -1,4 +1,5 @@
 """Pure helpers: resampling, formatting, env flags, queue polling, timers."""
+
 import asyncio
 import json
 import os
@@ -91,12 +92,24 @@ def test_timer_persistence_and_restore():
             ns["TIMERS_FILE"].write_text(
                 json.dumps(
                     [
-                        {"timer_id": 3, "label": "future", "duration_seconds": 100,
-                         "due_at": (now + timedelta(seconds=100)).isoformat()},
-                        {"timer_id": 5, "label": "late", "duration_seconds": 100,
-                         "due_at": (now - timedelta(seconds=30)).isoformat()},
-                        {"timer_id": 7, "label": "stale", "duration_seconds": 100,
-                         "due_at": (now - timedelta(hours=2)).isoformat()},
+                        {
+                            "timer_id": 3,
+                            "label": "future",
+                            "duration_seconds": 100,
+                            "due_at": (now + timedelta(seconds=100)).isoformat(),
+                        },
+                        {
+                            "timer_id": 5,
+                            "label": "late",
+                            "duration_seconds": 100,
+                            "due_at": (now - timedelta(seconds=30)).isoformat(),
+                        },
+                        {
+                            "timer_id": 7,
+                            "label": "stale",
+                            "duration_seconds": 100,
+                            "due_at": (now - timedelta(hours=2)).isoformat(),
+                        },
                     ]
                 )
             )

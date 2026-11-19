@@ -8,6 +8,7 @@ Tests talk to the rig through the names below (`scenario`, `feed_mic`,
 `setting`, ...), never to the code under test's internals directly, so the rig
 can change with the code while the tests stay the same.
 """
+
 import asyncio
 import base64
 import contextlib
@@ -213,7 +214,6 @@ async def _scenario(body):
     controller = ns["NexusController"](None, None, None)
     controller.reset_for_connection()
     ns["clear_mic_queue"]()
-    ns["clear_barge_queue"]()
     for k in written:
         written[k] = [] if isinstance(written[k], list) else 0
     script["wake"] = 0.0

@@ -1,4 +1,5 @@
 """The conversation state machine, end to end, with no hardware."""
+
 import asyncio
 import threading
 import time
@@ -133,3 +134,39 @@ def test_strict_verification_with_buffered_playback():
 
     with h.setting(SPEAKER_VERIFY_MODE="strict", STREAMING_PLAYBACK=False):
         scenario(body)
+
+
+def test_wake_phrase_heard_by_the_microphone_loop_interrupts_playback():
+    async def body(ws, c):
+        await h.to_wait_response(ws, c)
+        ws.push({"type": "response.created", "response": {"id": "r2"}})
+        for _ in range(4):
+            ws.push({"type": "response.output_audio.delta", "response_id": "r2", "delta": b64(0.5)})
+        await wait_for(h.speaking, what="speaking")
+        await feed_mic(5)  # quiet blocks re-arm the detector after the first wake
+        assert h.speaking()
+        script["wake"] = 0.5
+        await feed_mic(2)
+        script["wake"] = 0.0
+        await wait_for(lambda: c.state == A.ACTIVE and c.active_origin == "interrupt", what="interrupt")
+        assert "response.cancel" in ws.types()
+
+    scenario(body)
+
+
+def test_one_spoken_wake_phrase_cannot_fire_twice():
+    async def body(ws, c):
+        await feed_mic(3)
+        script["wake"] = 0.5  # the phrase stays in the model's memory for a while
+        await feed_mic(1)
+        await wait_for(lambda: c.state == A.ACTIVE, what="ACTIVE")
+        c.return_to_wake()
+        await feed_mic(6)
+        assert c.state == A.WAIT_WAKE, "the same phrase woke Nexus again"
+        script["wake"] = 0.0
+        await feed_mic(5)
+        script["wake"] = 0.5  # a new phrase
+        await feed_mic(1)
+        await wait_for(lambda: c.state == A.ACTIVE, what="ACTIVE again")
+
+    scenario(body)
