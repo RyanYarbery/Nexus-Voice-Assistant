@@ -234,6 +234,21 @@ SPEAKER_VAD_FALLBACK_SECONDS = 0.8
 FOLLOWUP_SECONDS = env_float(
     "NEXUS_FOLLOWUP_SECONDS", 5.0, "How long the microphone stays open for a follow-up after a reply."
 )
+FOLLOWUP_GUARD_SECONDS = env_float(
+    "NEXUS_FOLLOWUP_GUARD_SECONDS",
+    0.35,
+    "Microphone ignored for this long after a reply ends, so the tail of Nexus's own voice is not heard.",
+)
+FOLLOWUP_KEEP_OPEN = env_flag(
+    "NEXUS_FOLLOWUP_KEEP_OPEN",
+    True,
+    "Keep the follow-up window open after a short or rejected sound (0 = one sound closes it).",
+)
+FOLLOWUP_MIN_SPEECH_SECONDS = env_float(
+    "NEXUS_FOLLOWUP_MIN_SPEECH_SECONDS",
+    0.4,
+    "Sounds shorter than this in the follow-up window are ignored.",
+)
 FOLLOWUP_VERIFY_SECONDS = 2.2
 FOLLOWUP_OVERLAP_SECONDS = 0.6
 
@@ -3879,6 +3894,9 @@ class NexusController:
         # When the reply being waited for is given up on (0 = no limit running).
         self.reply_deadline = 0.0
 
+        # Microphone blocks are dropped until this time (follow-up guard).
+        self.mic_ignore_until = 0.0
+
         self.wake_gate = WakeGate()
         self.link = Link()
         self.was_speaking = False
@@ -3961,6 +3979,10 @@ class NexusController:
             timeout=FOLLOWUP_SECONDS,
         )
 
+        if not interrupted and FOLLOWUP_KEEP_OPEN:
+            # The room is still ringing with Nexus's own last word.
+            self.mic_ignore_until = time.monotonic() + FOLLOWUP_GUARD_SECONDS
+
         self.pending_input_clear = True
 
     def _clear_buffers(
@@ -4001,6 +4023,7 @@ class NexusController:
         self.followup_deadline = 0.0
         self.active_deadline = 0.0
         self.wake_cooldown_until = 0.0
+        self.mic_ignore_until = 0.0
         self.active_channel = 0
 
         self.state = AssistantState.WAIT_WAKE
@@ -4154,6 +4177,28 @@ async def score_speaker(
     return result0[0], result1[0]
 
 
+def followup_can_stay_open(controller):
+    return (
+        FOLLOWUP_KEEP_OPEN
+        and controller.state == AssistantState.ACTIVE
+        and controller.active_origin == "followup"
+        and time.monotonic() < controller.active_deadline
+    )
+
+
+async def reopen_followup(ws, controller):
+    """Forget a sound heard in the follow-up window and keep the window open."""
+    try:
+        await clear_openai_input(ws)
+    except Exception:
+        pass
+
+    controller.verify_blocks = []
+    controller.verification_pending = SPEAKER_VERIFY_MODE == "soft"
+    controller.speech_started_seen = False
+    controller.speech_start_block_index = None
+
+
 async def reject_current_speaker(
     ws,
     controller,
@@ -4214,6 +4259,14 @@ async def verify_speaker(
 
     if best_similarity < SPEAKER_THRESHOLD:
         print("Speaker rejected.")
+
+        if followup_can_stay_open(controller) and not controller.response_active:
+            # An unknown voice or the echo of Nexus's own: ignore it, but
+            # the person it was talking to may still want to follow up.
+            print("Follow-up window stays open.")
+            await reopen_followup(ws, controller)
+            return False
+
         await reject_current_speaker(ws, controller)
         return False
 
@@ -4332,6 +4385,9 @@ async def handle_microphone_block(
             score0,
             score1,
         )
+        return
+
+    if time.monotonic() < controller.mic_ignore_until:
         return
 
     if controller.state == AssistantState.WAIT_WAKE:
@@ -4686,6 +4742,14 @@ async def receive_events(
                 and controller.speech_started_seen
                 and not controller.response_active
             ):
+                if (
+                    followup_can_stay_open(controller)
+                    and time.monotonic() - controller.speech_started_at < FOLLOWUP_MIN_SPEECH_SECONDS
+                ):
+                    print("Short sound ignored; follow-up window stays open.")
+                    await reopen_followup(ws, controller)
+                    continue
+
                 controller.speech_started_seen = False
 
                 print("You stopped speaking.")
