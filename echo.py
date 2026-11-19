@@ -1455,6 +1455,22 @@ async def play_beeps(
         * 32767
     ).astype(np.int16)
 
+    # Speakers may hang off the array's own jack, which plays the continuous
+    # reference stream (2026-11-19, docs/WAKE-RECORDING.md). Mirror the beeps
+    # there too so alarms stay audible and the echo canceller knows about them.
+    reference_tone = None
+    ref_out = reference_output
+    if ref_out is not None:
+        t_ref = np.arange(
+            int(AEC_REFERENCE_RATE * beep_seconds),
+            dtype=np.float32,
+        ) / AEC_REFERENCE_RATE
+        reference_tone = (
+            np.sin(2 * np.pi * frequency * t_ref)
+            * volume
+            * 32767
+        ).astype(np.int16)
+
     async with playback_lock():
         # Hold assistant_speaking for the whole ring so microphone
         # audio keeps flowing to the barge-in monitor, which lets
@@ -1470,6 +1486,9 @@ async def play_beeps(
                         "Beeps silenced by wake phrase."
                     )
                     break
+
+                if ref_out is not None and reference_tone is not None:
+                    ref_out.write(reference_tone)
 
                 await asyncio.to_thread(
                     sd.play,
