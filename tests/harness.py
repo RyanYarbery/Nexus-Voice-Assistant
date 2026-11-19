@@ -117,6 +117,8 @@ ns["get_wake_score"] = lambda model, block: script["wake"]
 ns["speaker_similarity"] = lambda rec, emb, audio: script["speaker"]
 
 DEFAULTS = {
+    "TIMER_RING_SECONDS": 0.0,  # a fixed number of beeps
+    "ALARM_RING_SECONDS": 0.0,
     "NOTICE_TTS": "off",  # tones only: no speech synthesiser needed
     "NOTICE_MIN_GAP_SECONDS": 0.0,
     "STATUS_FILE": pathlib.Path(_tmp) / "status.json",
@@ -218,8 +220,8 @@ def speaker_lock_held():
     return ns["playback_lock"]().locked()
 
 
-def play_beeps(count=8):
-    return ns["play_beeps"](880, 0.05, 0.05, count, 0.1)
+def play_beeps(count=8, ring_seconds=0.0):
+    return ns["play_beeps"](880, 0.05, 0.05, count, 0.1, ring_seconds=ring_seconds)
 
 
 async def _scenario(body):

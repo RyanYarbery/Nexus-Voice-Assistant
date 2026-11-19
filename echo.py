@@ -138,10 +138,6 @@ SETTINGS_FILE = Path(
 
 TIMERS_FILE = Path(env_str("NEXUS_TIMERS_FILE", str(BASE_DIR / "timers.json"), "Saved timers."))
 
-# A restored timer that expired while Nexus was down still rings if
-# it is no later than this; older ones are silently discarded.
-TIMER_LATE_GRACE_SECONDS = 600
-
 # Output device used as the XVF3800 far-end echo-cancellation
 # reference. Defaults to the microphone's own playback endpoint.
 # Set to "off" for microphones without one; barge-in then relies on
@@ -475,6 +471,32 @@ NTFY_URL = env_str(
     "",
     "ntfy topic address for push alerts when the status changes; empty for none.",
     secret=True,
+)
+
+TIMER_RING_SECONDS = env_float(
+    "NEXUS_TIMER_RING_SECONDS",
+    60,
+    "A finished timer rings until the wake phrase or this long (0 = a fixed number of beeps).",
+)
+ALARM_RING_SECONDS = env_float(
+    "NEXUS_ALARM_RING_SECONDS",
+    180,
+    "An alarm rings until the wake phrase or this long (0 = a fixed number of beeps).",
+)
+BEEP_HOLD_MAX_SECONDS = env_float(
+    "NEXUS_BEEP_HOLD_MAX_SECONDS",
+    60,
+    "Beeps wait up to this long for a request in progress to end (0 = ring at once).",
+)
+MISSED_NOTES = env_flag(
+    "NEXUS_MISSED_ALARM_NOTES",
+    True,
+    "Have Nexus mention, with its next reply, an alarm or timer missed while it was off.",
+)
+LATE_GRACE_SECONDS = env_float(
+    "NEXUS_LATE_GRACE_SECONDS",
+    600,
+    "A timer or alarm that came due while Nexus was off still rings if it is no later than this.",
 )
 
 OPENAI_VOICE = env_str("NEXUS_VOICE", "marin", "OpenAI voice used for replies.")
@@ -1832,13 +1854,32 @@ def format_duration(seconds):
     return " ".join(parts)
 
 
+async def wait_for_turn_to_end():
+    """Beeps must not take the microphone away from a request in progress."""
+    controller = active_controller
+
+    if controller is None or BEEP_HOLD_MAX_SECONDS <= 0:
+        return
+
+    deadline = time.monotonic() + BEEP_HOLD_MAX_SECONDS
+
+    while controller.state != AssistantState.WAIT_WAKE and time.monotonic() < deadline:
+        await asyncio.sleep(0.1)
+
+
 async def play_beeps(
     frequency,
     beep_seconds,
     gap_seconds,
     count,
     volume,
+    ring_seconds=0.0,
 ):
+    """Ring until the wake phrase is heard. Returns True if it was silenced that way.
+
+    With ring_seconds the ring lasts that long at most; otherwise it is
+    `count` beeps.
+    """
     t = (
         np.arange(
             int(OUTPUT_RATE * beep_seconds),
@@ -1849,18 +1890,38 @@ async def play_beeps(
 
     tone = (np.sin(2 * np.pi * frequency * t) * volume * 32767).astype(np.int16)
 
+    # A copy for the microphone array's echo canceller, so the wake
+    # phrase can be heard over the beeps.
+    reference_tone = resample_int16(tone, OUTPUT_RATE, AEC_REFERENCE_RATE)
+
+    await wait_for_turn_to_end()
+
+    silenced = False
+
     async with playback_lock():
-        # Hold assistant_speaking for the whole ring so microphone
-        # audio keeps flowing to the barge-in monitor, which lets
-        # "Hey Nexus" silence the beeps.
+        # Hold assistant_speaking for the whole ring so the microphone
+        # loop treats the wake phrase as "be quiet".
         barge_in_event.clear()
         assistant_speaking.set()
 
+        started = time.monotonic()
+        played = 0
+
         try:
-            for _ in range(count):
+            while True:
                 if barge_in_event.is_set():
                     print("Beeps silenced by wake phrase.")
+                    silenced = True
                     break
+
+                if ring_seconds > 0:
+                    if time.monotonic() - started >= ring_seconds:
+                        break
+                elif played >= count:
+                    break
+
+                if reference_output is not None:
+                    reference_output.write(reference_tone)
 
                 await asyncio.to_thread(
                     sd.play,
@@ -1870,12 +1931,16 @@ async def play_beeps(
                     blocking=True,
                 )
 
+                played += 1
+
                 await asyncio.sleep(gap_seconds)
 
         finally:
             assistant_speaking.clear()
             barge_in_event.clear()
             clear_mic_queue()
+
+    return silenced
 
 
 async def play_timer_alarm(
@@ -1888,13 +1953,17 @@ async def play_timer_alarm(
     print(f"Label: {label}")
     print("=================================")
 
-    await play_beeps(
+    silenced = await play_beeps(
         TIMER_TONE_FREQUENCY,
         TIMER_BEEP_SECONDS,
         TIMER_BEEP_GAP,
         TIMER_BEEP_COUNT,
         TIMER_VOLUME,
+        ring_seconds=TIMER_RING_SECONDS,
     )
+
+    if not silenced and TIMER_RING_SECONDS > 0:
+        send_alert("Nexus timer not dismissed", f"Timer '{label}' rang and nobody answered.")
 
 
 def save_timers():
@@ -2002,8 +2071,9 @@ async def restore_timers():
 
         remaining = due_at.timestamp() - now.timestamp()
 
-        if remaining < -TIMER_LATE_GRACE_SECONDS:
+        if remaining < -LATE_GRACE_SECONDS:
             print(f"Discarding stale timer #{timer_id}: {label}")
+            note_missed(f"the timer '{label}', which ended at {format_alarm_time(due_at)}")
             continue
 
         register_timer(
@@ -2180,6 +2250,49 @@ async def cancel_local_timer(
 
 
 # =========================================================
+# MISSED ALARMS AND TIMERS
+# =========================================================
+
+# What came due while Nexus was off and was too late to ring. The owner
+# is told by push message at once, and by Nexus itself with the next
+# reply.
+missed_events = []
+
+
+def note_missed(description):
+    missed_events.append(description)
+
+    send_alert("Nexus missed an alarm", f"While Nexus was off it missed {description}.")
+
+
+async def send_missed_note(ws):
+    """Before a reply is asked for: tell the model what was missed so it says so first."""
+    if not missed_events or not MISSED_NOTES:
+        return
+
+    text = (
+        "System note: while you were switched off you missed "
+        + "; ".join(missed_events)
+        + ". Tell the user this first, briefly, then answer their request."
+    )
+
+    missed_events.clear()
+
+    await ws.send(
+        json.dumps(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            }
+        )
+    )
+
+
+# =========================================================
 # PERSISTENT ALARMS
 # =========================================================
 
@@ -2258,13 +2371,17 @@ async def play_alarm_sound(
     print(f"Label: {label}")
     print("=================================")
 
-    await play_beeps(
+    silenced = await play_beeps(
         ALARM_TONE_FREQUENCY,
         ALARM_BEEP_SECONDS,
         ALARM_BEEP_GAP,
         ALARM_BEEP_COUNT,
         ALARM_VOLUME,
+        ring_seconds=ALARM_RING_SECONDS,
     )
+
+    if not silenced and ALARM_RING_SECONDS > 0:
+        send_alert("Nexus alarm not dismissed", f"Alarm '{label}' rang and nobody answered.")
 
 
 async def alarm_worker(
@@ -2512,9 +2629,15 @@ async def restore_alarms():
             alarm_id,
         )
 
-        if target.timestamp() <= now.timestamp():
+        if target.timestamp() < now.timestamp() - LATE_GRACE_SECONDS:
             print(f"Discarding expired alarm #{alarm_id}: {label}")
+            note_missed(f"the alarm '{label}' set for {format_alarm_time(target)}")
             continue
+
+        if target.timestamp() <= now.timestamp():
+            # Came due while Nexus was off or starting, recently enough
+            # to still matter: the worker rings it at once.
+            print(f"Alarm #{alarm_id} came due while Nexus was off; ringing it now.")
 
         alarms[alarm_id] = {
             "alarm_id": alarm_id,
@@ -3843,6 +3966,11 @@ class AssistantState:
     FOLLOWUP = "followup"
 
 
+# The controller of the running assistant, for code (beeps, tools)
+# that needs to know whether a request is in progress.
+active_controller = None
+
+
 class NexusController:
     def __init__(
         self,
@@ -3850,6 +3978,9 @@ class NexusController:
         enrolled_ch0,
         enrolled_ch1,
     ):
+        global active_controller
+        active_controller = self
+
         self.recognizer = recognizer
         self.enrolled_embeddings = (
             enrolled_ch0,
@@ -4770,6 +4901,8 @@ async def receive_events(
                 controller.response_active = True
 
                 print("Thinking...")
+
+                await send_missed_note(ws)
 
                 await create_response(ws)
 
