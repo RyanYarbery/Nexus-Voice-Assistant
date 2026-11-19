@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nexus-voice-assistant"
+version = "2.0.0"
+description = "A self-hosted voice assistant built from swappable parts: your microphone, your wake word, your features."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["numpy", "scipy"]
+
+[project.optional-dependencies]
+# Install only what the parts you chose need.
+audio = ["sounddevice"]                # NEXUS_AUDIO=generic or xvf3800
+openai = ["websockets"]                # NEXUS_BACKEND=openai
+openwakeword = ["openwakeword"]        # NEXUS_WAKE=openwakeword
+ecapa = ["torch", "speechbrain"]       # NEXUS_SPEAKER_ID=ecapa
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+nexus = "nexus.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["nexus*"]
+
+[tool.setuptools.package-data]
+nexus = ["personas/*.txt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
+
+[tool.ruff]
+line-length = 110

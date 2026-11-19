@@ -6,12 +6,13 @@ After=network-online.target sound.target
 [Service]
 # Nexus tells systemd when it is ready and then pings it from the
 # microphone loop. If the loop freezes or the microphone dies, the pings
-# stop and systemd restarts the service. Loading the models from a slow
-# disk can take minutes, hence the long start timeout.
+# stop and systemd restarts the service. Loading models from a slow disk
+# can take minutes, hence the long start timeout.
 Type=notify
 NotifyAccess=main
 WatchdogSec=60
 TimeoutStartSec=900
+
 User=YOUR_USER
 Group=YOUR_USER
 WorkingDirectory=/home/YOUR_USER/nexus-voice-assistant
@@ -21,12 +22,19 @@ Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/home/YOUR_USER/.config/nexus/env
 
 ExecStartPre=/bin/sleep 5
-ExecStart=/home/YOUR_USER/nexus-voice-assistant/.venv/bin/python /home/YOUR_USER/nexus-voice-assistant/echo.py
+ExecStart=/home/YOUR_USER/nexus-voice-assistant/.venv/bin/python -m nexus
 
 Restart=always
 RestartSec=5
 TimeoutStopSec=10
 KillSignal=SIGINT
+
+# Keep Nexus's log in its own journal so a chatty neighbour cannot push
+# it out. Needs /etc/systemd/journald@nexus.conf, for example:
+#   [Journal]
+#   SystemMaxUse=200M
+#   MaxRetentionSec=90day
+# LogNamespace=nexus
 
 [Install]
 WantedBy=multi-user.target

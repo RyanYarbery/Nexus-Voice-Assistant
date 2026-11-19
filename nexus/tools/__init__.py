@@ -252,7 +252,10 @@ def load_entry_points():
     try:
         from importlib.metadata import entry_points
 
-        found = entry_points(group="nexus.plugins")
+        try:
+            found = entry_points(group="nexus.plugins")
+        except TypeError:  # Python 3.9
+            found = entry_points().get("nexus.plugins", [])
     except Exception:
         return
 
