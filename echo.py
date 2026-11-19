@@ -40,6 +40,49 @@ from speechbrain.inference.speaker import SpeakerRecognition
 # =========================================================
 # CONFIGURATION
 # =========================================================
+#
+# Every value a user might tune is read from the environment through
+# one of the env_* helpers below. Each call records the setting, so the
+# settings in effect can be printed at start.
+
+SETTINGS = {}
+
+
+def _setting(name, default, convert, doc):
+    raw = os.environ.get(name)
+    value = default
+
+    if raw is not None and raw.strip() != "":
+        try:
+            value = convert(raw.strip())
+        except (TypeError, ValueError):
+            print(f"WARNING: {name}={raw!r} is not valid; using {default!r}.")
+
+    SETTINGS[name] = {"value": value, "default": default, "doc": doc}
+
+    return value
+
+
+def env_str(name, default, doc=""):
+    return _setting(name, default, str, doc)
+
+
+def env_float(name, default, doc=""):
+    return _setting(name, default, float, doc)
+
+
+def env_int(name, default, doc=""):
+    return _setting(name, default, lambda raw: int(float(raw)), doc)
+
+
+def env_flag(name, default=False, doc=""):
+    return _setting(
+        name,
+        default,
+        lambda raw: raw.lower() in ("1", "true", "yes", "on"),
+        doc,
+    )
+
 
 INPUT_RATE = 16000
 MODEL_RATE = 24000
@@ -48,67 +91,50 @@ OUTPUT_RATE = 48000
 AEC_REFERENCE_RATE = 16000
 
 BASE_DIR = Path(
-    os.environ.get(
-        "NEXUS_HOME",
-        str(Path(__file__).resolve().parent),
-    )
+    env_str("NEXUS_HOME", str(Path(__file__).resolve().parent), "Folder holding models and saved state.")
 ).expanduser()
 
-OPENAI_MODEL = os.environ.get(
+OPENAI_MODEL = env_str(
     "OPENAI_REALTIME_MODEL",
     "gpt-realtime",
+    "OpenAI Realtime model name.",
 )
 
-MIC_NAME = os.environ.get(
-    "NEXUS_MIC_NAME",
-    "respeaker xvf3800",
-)
+MIC_NAME = env_str("NEXUS_MIC_NAME", "respeaker xvf3800", "Part of the microphone's device name.")
 
-SPEAKER_NAME = os.environ.get(
-    "NEXUS_SPEAKER_NAME",
-    "alc3234 analog",
-)
+SPEAKER_NAME = env_str("NEXUS_SPEAKER_NAME", "alc3234 analog", "Part of the speaker's device name.")
 
-WAKE_MODEL_PATH = os.environ.get(
+WAKE_MODEL_PATH = env_str(
     "NEXUS_WAKE_MODEL_PATH",
     str(BASE_DIR / "models" / "hey_nexus.onnx"),
+    "openWakeWord .onnx model for the wake phrase.",
 )
 
-VOICE_PROFILE_CH0_PATH = os.environ.get(
+VOICE_PROFILE_CH0_PATH = env_str(
     "NEXUS_VOICE_PROFILE_CH0",
     str(BASE_DIR / "models" / "voice_ch0.pt"),
+    "Enrolled voice profile for microphone channel 0.",
 )
 
-VOICE_PROFILE_CH1_PATH = os.environ.get(
+VOICE_PROFILE_CH1_PATH = env_str(
     "NEXUS_VOICE_PROFILE_CH1",
     str(BASE_DIR / "models" / "voice_ch1.pt"),
+    "Enrolled voice profile for microphone channel 1.",
 )
 
-SPEAKER_MODEL_CACHE = os.environ.get(
+SPEAKER_MODEL_CACHE = env_str(
     "NEXUS_SPEAKER_MODEL_CACHE",
     str(BASE_DIR / "models" / "spkrec-ecapa-voxceleb"),
+    "Folder for the downloaded speaker-recognition model.",
 )
 
-ALARMS_FILE = Path(
-    os.environ.get(
-        "NEXUS_ALARMS_FILE",
-        str(BASE_DIR / "alarms.json"),
-    )
-)
+ALARMS_FILE = Path(env_str("NEXUS_ALARMS_FILE", str(BASE_DIR / "alarms.json"), "Saved alarms."))
 
 SETTINGS_FILE = Path(
-    os.environ.get(
-        "NEXUS_SETTINGS_FILE",
-        str(BASE_DIR / "settings.json"),
-    )
+    env_str("NEXUS_SETTINGS_FILE", str(BASE_DIR / "settings.json"), "Saved location and preferences.")
 )
 
-TIMERS_FILE = Path(
-    os.environ.get(
-        "NEXUS_TIMERS_FILE",
-        str(BASE_DIR / "timers.json"),
-    )
-)
+TIMERS_FILE = Path(env_str("NEXUS_TIMERS_FILE", str(BASE_DIR / "timers.json"), "Saved timers."))
 
 # A restored timer that expired while Nexus was down still rings if
 # it is no later than this; older ones are silently discarded.
@@ -118,9 +144,10 @@ TIMER_LATE_GRACE_SECONDS = 600
 # reference. Defaults to the microphone's own playback endpoint.
 # Set to "off" for microphones without one; barge-in then relies on
 # the raw wake-word score alone.
-AEC_REFERENCE_NAME = os.environ.get(
+AEC_REFERENCE_NAME = env_str(
     "NEXUS_AEC_REFERENCE_NAME",
     MIC_NAME,
+    'Output that receives a copy of playback for echo cancelling; "off" for none.',
 )
 
 NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
@@ -129,18 +156,31 @@ OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
 HTTP_TIMEOUT_SECONDS = 12
 
-HTTP_USER_AGENT = os.environ.get(
+HTTP_USER_AGENT = env_str(
     "NEXUS_HTTP_USER_AGENT",
     "NexusHouseholdAssistant/1.0 (personal non-commercial assistant)",
+    "User-Agent sent to the geocoding and weather services.",
 )
 
-WAKE_THRESHOLD = 0.10
-SPEAKER_THRESHOLD = 0.25
+WAKE_THRESHOLD = env_float(
+    "NEXUS_WAKE_THRESHOLD",
+    0.10,
+    "Wake-word score (0 to 1) at which Nexus wakes.",
+)
+SPEAKER_THRESHOLD = env_float(
+    "NEXUS_SPEAKER_THRESHOLD",
+    0.25,
+    "Voice-match score below which the speaker is rejected.",
+)
 
 INPUT_BLOCK_FRAMES = 1280
 
-WAKE_PREROLL_SECONDS = 1.0
-SPEAKER_VERIFY_SECONDS = 1.6
+WAKE_PREROLL_SECONDS = env_float(
+    "NEXUS_WAKE_PREROLL_SECONDS", 1.0, "Audio kept from before the wake word fired."
+)
+SPEAKER_VERIFY_SECONDS = env_float(
+    "NEXUS_SPEAKER_VERIFY_SECONDS", 1.6, "Strict mode: audio gathered before the speaker is judged."
+)
 
 # Speech-aware speaker verification.  Instead of scoring arbitrary
 # fixed windows, find the strongest contiguous speech region around
@@ -155,26 +195,34 @@ SPEAKER_VAD_MARGIN_MS = 120
 SPEAKER_VAD_MIN_SECONDS = 0.45
 SPEAKER_VAD_MAX_SECONDS = 1.35
 
-WAKE_REJECT_COOLDOWN_SECONDS = 1.0
+WAKE_REJECT_COOLDOWN_SECONDS = env_float(
+    "NEXUS_WAKE_REJECT_COOLDOWN_SECONDS", 1.0, "Wake word ignored for this long after a rejected speaker."
+)
 
 # The wake models are not fed while a request is active, so their
 # feature buffers still end with the last wake phrase when listening
 # resumes. Keep scoring (to flush them) but ignore detections for this
 # long after every return to wake, or the old phrase fires again.
-WAKE_RESUME_COOLDOWN_SECONDS = 2.0
+WAKE_RESUME_COOLDOWN_SECONDS = env_float(
+    "NEXUS_WAKE_RESUME_COOLDOWN_SECONDS", 2.0, "Wake word ignored for this long after each exchange."
+)
 
 # When the speech-aware trimmer finds less than this much speech, the
 # untrimmed window is scored as well and the better score is used.
 SPEAKER_VAD_FALLBACK_SECONDS = 0.8
 
-FOLLOWUP_SECONDS = 5.0
+FOLLOWUP_SECONDS = env_float(
+    "NEXUS_FOLLOWUP_SECONDS", 5.0, "How long the microphone stays open for a follow-up after a reply."
+)
 FOLLOWUP_VERIFY_SECONDS = 2.2
 FOLLOWUP_OVERLAP_SECONDS = 0.6
 
 # After speaker verification, microphone audio streams to OpenAI
 # until server VAD reports speech. If no speech is ever detected,
 # stop streaming and return to wake instead of uploading indefinitely.
-ACTIVE_SPEECH_TIMEOUT_SECONDS = 10.0
+ACTIVE_SPEECH_TIMEOUT_SECONDS = env_float(
+    "NEXUS_ACTIVE_SPEECH_TIMEOUT_SECONDS", 10.0, "Give up on a request if no speech starts within this."
+)
 
 # =========================================================
 # HEY NEXUS BARGE-IN
@@ -188,28 +236,27 @@ ACTIVE_SPEECH_TIMEOUT_SECONDS = 10.0
 # Requiring the wake phrase prevents ordinary nearby speech
 # from being mistaken for an interruption.
 
-BARGE_WAKE_THRESHOLD = 0.30
+BARGE_WAKE_THRESHOLD = env_float(
+    "NEXUS_BARGE_WAKE_THRESHOLD",
+    0.30,
+    "Wake-word score needed to interrupt Nexus while it is speaking.",
+)
 
+# Which microphone channel may trigger an interruption: ch0 (the
+# echo-cancelled beam, the default), ch1, or best (the higher score).
+BARGE_CHANNEL = env_str(
+    "NEXUS_BARGE_CHANNEL", "ch0", "Channel that can interrupt playback: ch0, ch1 or best."
+).lower()
 
-def env_flag(name, default=False):
-    value = os.environ.get(name)
-
-    if value is None:
-        return default
-
-    return value.strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-
+if BARGE_CHANNEL not in ("ch0", "ch1", "best"):
+    print(f"WARNING: unknown NEXUS_BARGE_CHANNEL {BARGE_CHANNEL!r}; using 'ch0'.")
+    BARGE_CHANNEL = "ch0"
 
 # Per-block score logging is useful while tuning thresholds but
 # floods journald in normal operation. Enable with NEXUS_BARGE_DEBUG=1
 # and NEXUS_WAKE_DEBUG=1.
-BARGE_DEBUG = env_flag("NEXUS_BARGE_DEBUG")
-WAKE_DEBUG = env_flag("NEXUS_WAKE_DEBUG")
+BARGE_DEBUG = env_flag("NEXUS_BARGE_DEBUG", False, "Print barge-in peak scores twice a second.")
+WAKE_DEBUG = env_flag("NEXUS_WAKE_DEBUG", False, "Print wake scores above 0.02.")
 BARGE_DEBUG_INTERVAL_SECONDS = 0.50
 
 # =========================================================
@@ -221,14 +268,22 @@ BARGE_DEBUG_INTERVAL_SECONDS = 0.50
 # response.cancel to the server on barge-in. NEXUS_STREAMING_PLAYBACK=0
 # restores the original buffered behaviour.
 
-STREAMING_PLAYBACK = env_flag("NEXUS_STREAMING_PLAYBACK", True)
-PLAYBACK_PREBUFFER_SECONDS = 0.3
+STREAMING_PLAYBACK = env_flag(
+    "NEXUS_STREAMING_PLAYBACK",
+    True,
+    "Start speaking as soon as audio arrives (0 = wait for the whole reply).",
+)
+PLAYBACK_PREBUFFER_SECONDS = env_float(
+    "NEXUS_PLAYBACK_PREBUFFER_SECONDS", 0.3, "Audio buffered before the speaker starts."
+)
 
 # The XVF3800 locks its master clock to the host playback stream and
 # free-runs when none is open. Keeping one reference stream open for
 # the life of the process (writing silence between replies) avoids a
 # clock re-lock and AEC re-convergence at the start of every reply.
-AEC_REFERENCE_CONTINUOUS = env_flag("NEXUS_AEC_REFERENCE_CONTINUOUS", True)
+AEC_REFERENCE_CONTINUOUS = env_flag(
+    "NEXUS_AEC_REFERENCE_CONTINUOUS", True, "Keep the echo-cancelling reference stream open all the time."
+)
 
 # =========================================================
 # SPEAKER VERIFICATION
@@ -241,14 +296,9 @@ AEC_REFERENCE_CONTINUOUS = env_flag("NEXUS_AEC_REFERENCE_CONTINUOUS", True)
 #            has been verified before any audio leaves the machine.
 #   off    - no speaker verification.
 
-SPEAKER_VERIFY_MODE = (
-    os.environ.get(
-        "NEXUS_SPEAKER_VERIFY_MODE",
-        "soft",
-    )
-    .strip()
-    .lower()
-)
+SPEAKER_VERIFY_MODE = env_str(
+    "NEXUS_SPEAKER_VERIFY_MODE", "soft", "Voice check: soft, strict or off."
+).lower()
 
 if SPEAKER_VERIFY_MODE not in ("soft", "strict", "off"):
     print(f"WARNING: unknown NEXUS_SPEAKER_VERIFY_MODE {SPEAKER_VERIFY_MODE!r}; using 'soft'.")
@@ -256,20 +306,23 @@ if SPEAKER_VERIFY_MODE not in ("soft", "strict", "off"):
 
 # Soft mode judges the speaker on up to this much audio (wake-word
 # pre-roll included), or on whatever has arrived when speech stops.
-SOFT_VERIFY_SECONDS = 2.5
+SOFT_VERIFY_SECONDS = env_float(
+    "NEXUS_SOFT_VERIFY_SECONDS", 2.5, "Soft mode: most audio used to judge the speaker."
+)
 
 # The timed soft check waits until the server has reported speech and at
 # least this much of it has arrived, so a pause after the wake phrase is
 # not judged as if it were the request.
-SOFT_VERIFY_SPEECH_SECONDS = 1.0
+SOFT_VERIFY_SPEECH_SECONDS = env_float(
+    "NEXUS_SOFT_VERIFY_SPEECH_SECONDS", 1.0, "Soft mode: speech needed before a timed check."
+)
 
 # Trim the verification audio to the strongest speech region before
 # scoring, so silence and room noise around the phrase do not dilute
 # the embedding. 0 scores the raw window instead.
-SPEAKER_SPEECH_AWARE = os.environ.get(
-    "NEXUS_SPEAKER_SPEECH_AWARE",
-    "1",
-).strip().lower() not in ("0", "false", "no", "off")
+SPEAKER_SPEECH_AWARE = env_flag(
+    "NEXUS_SPEAKER_SPEECH_AWARE", True, "Trim the audio to the speech before the voice check."
+)
 
 # Microphone audio kept while waiting for a reply so that speech
 # captured right after a barge-in is not lost.
@@ -283,25 +336,86 @@ RECENT_BLOCKS_MAX = max(
     int(0.8 * INPUT_RATE / INPUT_BLOCK_FRAMES),
 )
 
-RESPEAKER_ROUTE_HELPER = os.environ.get(
+RESPEAKER_ROUTE_HELPER = env_str(
     "NEXUS_RESPEAKER_ROUTE_HELPER",
     "/usr/local/bin/nexus-respeaker-route",
+    "Optional helper that sets up the ReSpeaker's channel routing.",
 )
 
 RECONNECT_INITIAL_SECONDS = 1
-RECONNECT_MAX_SECONDS = 15
+RECONNECT_MAX_SECONDS = env_int(
+    "NEXUS_RECONNECT_MAX_SECONDS", 15, "Longest wait between reconnect attempts after a network failure."
+)
 
 TIMER_TONE_FREQUENCY = 880
 TIMER_BEEP_SECONDS = 0.35
 TIMER_BEEP_GAP = 0.25
-TIMER_BEEP_COUNT = 10
-TIMER_VOLUME = 0.25
+TIMER_BEEP_COUNT = env_int("NEXUS_TIMER_BEEP_COUNT", 10, "Beeps when a timer ends.")
+TIMER_VOLUME = env_float("NEXUS_TIMER_VOLUME", 0.25, "Timer beep volume, 0 to 1.")
 
 ALARM_TONE_FREQUENCY = 1050
 ALARM_BEEP_SECONDS = 0.45
 ALARM_BEEP_GAP = 0.20
-ALARM_BEEP_COUNT = 16
-ALARM_VOLUME = 0.30
+ALARM_BEEP_COUNT = env_int("NEXUS_ALARM_BEEP_COUNT", 16, "Beeps when an alarm goes off.")
+ALARM_VOLUME = env_float("NEXUS_ALARM_VOLUME", 0.30, "Alarm beep volume, 0 to 1.")
+
+OPENAI_VOICE = env_str("NEXUS_VOICE", "marin", "OpenAI voice used for replies.")
+
+VAD_THRESHOLD = env_float("NEXUS_VAD_THRESHOLD", 0.5, "OpenAI speech detector sensitivity, 0 to 1.")
+VAD_SILENCE_MS = env_int("NEXUS_VAD_SILENCE_MS", 700, "Silence that ends your turn, in milliseconds.")
+VAD_PREFIX_MS = env_int("NEXUS_VAD_PREFIX_MS", 300, "Audio kept from before speech was detected.")
+
+PING_INTERVAL_SECONDS = env_float("NEXUS_PING_INTERVAL_SECONDS", 5, "Seconds between keep-alive pings.")
+PING_TIMEOUT_SECONDS = env_float(
+    "NEXUS_PING_TIMEOUT_SECONDS", 20, "Drop the connection after this long without a ping reply."
+)
+
+
+def describe_settings():
+    """One line per setting. Secrets never pass through SETTINGS."""
+    lines = []
+
+    for name in sorted(SETTINGS):
+        entry = SETTINGS[name]
+        mark = "*" if entry["value"] != entry["default"] else " "
+        lines.append(f"  {mark} {name}={entry['value']}")
+
+    return lines
+
+
+def code_version():
+    """The commit this code came from: NEXUS_COMMIT, a COMMIT file, or git."""
+    explicit = os.environ.get("NEXUS_COMMIT", "").strip()
+
+    if explicit:
+        return explicit
+
+    here = Path(__file__).resolve().parent
+
+    try:
+        text = (here / "COMMIT").read_text(encoding="utf-8").strip()
+
+        if text:
+            return text
+    except OSError:
+        pass
+
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(here), "rev-parse", "--short", "HEAD"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+
+        if completed.returncode == 0 and completed.stdout.strip():
+            return completed.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    return "unknown"
 
 
 # =========================================================
@@ -2591,7 +2705,9 @@ async def monitor_barge_in(
         # echo reduction on CH0, versus only 2.4 dB on CH1.
         # Trigger exclusively from the strongly cancelled CH0
         # path so Nexus's own playback cannot dominate detection.
-        if assistant_speaking.is_set() and score0 >= BARGE_WAKE_THRESHOLD:
+        barge_score = {"ch0": score0, "ch1": score1, "best": max(score0, score1)}[BARGE_CHANNEL]
+
+        if assistant_speaking.is_set() and barge_score >= BARGE_WAKE_THRESHOLD:
             print()
             print("*** HEY NEXUS INTERRUPT DETECTED ***")
 
@@ -4341,9 +4457,9 @@ async def configure_session(
                             },
                             "turn_detection": {
                                 "type": "server_vad",
-                                "threshold": 0.5,
-                                "prefix_padding_ms": 300,
-                                "silence_duration_ms": 700,
+                                "threshold": VAD_THRESHOLD,
+                                "prefix_padding_ms": VAD_PREFIX_MS,
+                                "silence_duration_ms": VAD_SILENCE_MS,
                                 "create_response": False,
                                 "interrupt_response": False,
                             },
@@ -4353,7 +4469,7 @@ async def configure_session(
                                 "type": "audio/pcm",
                                 "rate": MODEL_RATE,
                             },
-                            "voice": "marin",
+                            "voice": OPENAI_VOICE,
                         },
                     },
                 },
@@ -4381,8 +4497,8 @@ async def run_connection(
         url,
         additional_headers=headers,
         max_size=None,
-        ping_interval=5,
-        ping_timeout=5,
+        ping_interval=PING_INTERVAL_SECONDS,
+        ping_timeout=PING_TIMEOUT_SECONDS,
         close_timeout=3,
     ) as ws:
         print("Connected to OpenAI Realtime.")
@@ -4563,11 +4679,12 @@ async def main():
     else:
         print(f"AEC reference: {AEC_REFERENCE_DEVICE} - {sd.query_devices(AEC_REFERENCE_DEVICE)['name']}")
 
-    print(f"Wake model: {WAKE_MODEL_PATH}")
+    print(f"Code version: {code_version()}")
 
-    print(f"Wake threshold: {WAKE_THRESHOLD}")
+    print("Settings in effect (* = changed from the default):")
 
-    print(f"Speaker threshold: {SPEAKER_THRESHOLD}")
+    for line in describe_settings():
+        print(line)
 
     print("Microphone mode: XVF3800 adaptive dual-channel")
 
