@@ -170,3 +170,32 @@ def test_one_spoken_wake_phrase_cannot_fire_twice():
         await wait_for(lambda: c.state == A.ACTIVE, what="ACTIVE again")
 
     scenario(body)
+
+
+def test_each_request_is_logged_as_one_line_with_scores_timings_and_usage(capsys):
+    import json
+
+    async def body(ws, c):
+        await h.to_wait_response(ws, c)
+        ws.push({"type": "response.created", "response": {"id": "r1"}})
+        ws.push({"type": "response.output_audio.delta", "response_id": "r1", "delta": b64(0.1)})
+        ws.push(
+            {
+                "type": "response.done",
+                "response": {
+                    "id": "r1",
+                    "status": "completed",
+                    "output": [],
+                    "usage": {"input_tokens": 120, "output_tokens": 40},
+                },
+            }
+        )
+        await wait_for(lambda: c.state == A.ACTIVE and c.active_origin == "followup", what="follow-up")
+
+    scenario(body)
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("REQUEST ")]
+    first = json.loads(lines[0][len("REQUEST ") :])
+    assert first["origin"] == "wake" and first["outcome"] == "answered"
+    assert first["wake_ch0"] == 0.5 and first["speaker_ch0"] == 0.6
+    assert first["usage"] == {"input_tokens": 120, "output_tokens": 40}
+    assert first["speech_end"] <= first["first_audio"] <= first["reply_done"] <= first["seconds"]

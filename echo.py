@@ -96,9 +96,12 @@ BASE_DIR = Path(
     env_str("NEXUS_HOME", str(Path(__file__).resolve().parent), "Folder holding models and saved state.")
 ).expanduser()
 
+# OpenAI lists gpt-realtime for shutdown on 2027-01-20 with
+# gpt-realtime-2.1 as its replacement at the same price
+# (developers.openai.com/api/docs/deprecations, read 2026-11-18).
 OPENAI_MODEL = env_str(
     "OPENAI_REALTIME_MODEL",
-    "gpt-realtime",
+    "gpt-realtime-2.1",
     "OpenAI Realtime model name.",
 )
 
@@ -498,6 +501,25 @@ LATE_GRACE_SECONDS = env_float(
     600,
     "A timer or alarm that came due while Nexus was off still rings if it is no later than this.",
 )
+
+UPLINK_STREAM_RESAMPLE = env_flag(
+    "NEXUS_UPLINK_STREAM_RESAMPLE",
+    True,
+    "Resample microphone audio as one stream (0 = block by block, which clicks at block edges).",
+)
+REQUEST_LOG = env_flag(
+    "NEXUS_REQUEST_LOG", True, "Print one REQUEST line with scores, timings and usage per request."
+)
+NOISE_REDUCTION = env_str(
+    "NEXUS_NOISE_REDUCTION",
+    "off",
+    "OpenAI input noise filter: off, near_field or far_field.",
+).lower()
+TURN_DETECTION = env_str(
+    "NEXUS_TURN_DETECTION",
+    "server_vad",
+    "How OpenAI decides you have finished: server_vad (fixed silence) or semantic_vad.",
+).lower()
 
 OPENAI_VOICE = env_str("NEXUS_VOICE", "marin", "OpenAI voice used for replies.")
 
@@ -3378,6 +3400,16 @@ def handle_block_while_speaking(
 # =========================================================
 
 
+# One resampler for the whole upload stream. Resampling each 80 ms block
+# on its own leaves a small click at every block edge in what the
+# service hears.
+_uplink = {"resampler": None}
+
+
+def reset_uplink_resampler():
+    _uplink["resampler"] = StreamResampler(INPUT_RATE, MODEL_RATE)
+
+
 async def send_pcm_to_openai(
     ws,
     pcm_16k,
@@ -3385,11 +3417,17 @@ async def send_pcm_to_openai(
     if len(pcm_16k) == 0:
         return
 
-    pcm_24k = resample_int16(
-        pcm_16k,
-        INPUT_RATE,
-        MODEL_RATE,
-    )
+    if UPLINK_STREAM_RESAMPLE:
+        if _uplink["resampler"] is None:
+            reset_uplink_resampler()
+
+        pcm_24k = _uplink["resampler"].process(pcm_16k)
+    else:
+        pcm_24k = resample_int16(
+            pcm_16k,
+            INPUT_RATE,
+            MODEL_RATE,
+        )
 
     encoded = base64.b64encode(pcm_24k.tobytes()).decode("ascii")
 
@@ -3419,6 +3457,9 @@ async def send_blocks_to_openai(
 async def clear_openai_input(
     ws,
 ):
+    # A new utterance starts after a clear; start its resampling clean.
+    reset_uplink_resampler()
+
     await ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
 
 
@@ -3971,6 +4012,20 @@ class AssistantState:
 active_controller = None
 
 
+def add_usage(total, usage):
+    """Add the numbers in one reply's usage report into `total`, keeping its shape."""
+    for key, value in (usage or {}).items():
+        if isinstance(value, bool):
+            continue
+
+        if isinstance(value, (int, float)):
+            total[key] = total.get(key, 0) + value
+        elif isinstance(value, dict):
+            add_usage(total.setdefault(key, {}), value)
+
+    return total
+
+
 class NexusController:
     def __init__(
         self,
@@ -4025,6 +4080,11 @@ class NexusController:
         # When the reply being waited for is given up on (0 = no limit running).
         self.reply_deadline = 0.0
 
+        # Facts about the request in progress, printed as one line when
+        # it ends. Every tuning question needs this record.
+        self.request = None
+        self.request_count = 0
+
         # Microphone blocks are dropped until this time (follow-up guard).
         self.mic_ignore_until = 0.0
 
@@ -4047,6 +4107,38 @@ class NexusController:
         self.cancelled_response_id = None
         self.cancel_next_response = False
         self.playback_failures = 0
+
+    def begin_request(self, origin, **facts):
+        self.end_request("superseded")
+        self.request_count += 1
+        self.request = {"n": self.request_count, "origin": origin, "t0": time.monotonic(), "usage": {}}
+        self.request.update(facts)
+
+    def note_request(self, **facts):
+        if self.request is not None:
+            self.request.update(facts)
+
+    def mark_request(self, name):
+        """Record the time of a step, in seconds since the request began."""
+        if self.request is not None and name not in self.request:
+            self.request[name] = round(time.monotonic() - self.request["t0"], 2)
+
+    def end_request(self, outcome):
+        request = self.request
+        self.request = None
+
+        if request is None:
+            return
+
+        request["seconds"] = round(time.monotonic() - request.pop("t0"), 2)
+        request["outcome"] = outcome
+        request["model"] = OPENAI_MODEL
+
+        if not request["usage"]:
+            request.pop("usage")
+
+        if REQUEST_LOG:
+            print("REQUEST " + json.dumps(request, separators=(",", ":")), flush=True)
 
     def enter_active(
         self,
@@ -4110,6 +4202,8 @@ class NexusController:
             timeout=FOLLOWUP_SECONDS,
         )
 
+        self.begin_request("interrupt" if interrupted else "followup")
+
         if not interrupted and FOLLOWUP_KEEP_OPEN:
             # The room is still ringing with Nexus's own last word.
             self.mic_ignore_until = time.monotonic() + FOLLOWUP_GUARD_SECONDS
@@ -4145,6 +4239,8 @@ class NexusController:
             if player.task is not None:
                 player.task.cancel()
 
+        self.end_request("connection_reset")
+
         self._clear_buffers()
 
         self.response_active = False
@@ -4162,7 +4258,10 @@ class NexusController:
     def return_to_wake(
         self,
         rejected=False,
+        outcome=None,
     ):
+        self.end_request(outcome or ("rejected" if rejected else "ended"))
+
         self._clear_buffers()
 
         cooldown = WAKE_RESUME_COOLDOWN_SECONDS
@@ -4214,7 +4313,7 @@ async def give_up_on_reply(ws, controller, reason):
             pass
 
     controller.response_active = False
-    controller.return_to_wake()
+    controller.return_to_wake(outcome="no_reply")
 
     run_in_background(play_notice("error"))
 
@@ -4380,6 +4479,10 @@ async def verify_speaker(
 
     winner = 0 if similarity0 >= similarity1 else 1
     best_similarity = max(similarity0, similarity1)
+
+    controller.note_request(
+        speaker_ch0=round(float(similarity0), 3), speaker_ch1=round(float(similarity1), 3)
+    )
 
     print(
         f"{context} speaker CH0: {similarity0:.3f}   "
@@ -4548,6 +4651,12 @@ async def handle_microphone_block(
 
         controller.wake_gate.disarm()
 
+        controller.begin_request(
+            "wake" if ws.online else "wake_offline",
+            wake_ch0=round(score0, 3),
+            wake_ch1=round(score1, 3),
+        )
+
         print()
         print("*** HEY NEXUS DETECTED ***")
         print(f"Wake CH0: {score0:.3f}   CH1: {score1:.3f}   winner: CH{wake_winner}")
@@ -4659,7 +4768,7 @@ async def handle_microphone_block(
             except Exception:
                 pass
 
-            controller.return_to_wake()
+            controller.return_to_wake(outcome="no_speech")
             return
 
         if (
@@ -4676,7 +4785,7 @@ async def handle_microphone_block(
             except Exception:
                 pass
 
-            controller.return_to_wake()
+            controller.return_to_wake(outcome="too_long")
             return
 
         if controller.pending_input_clear:
@@ -4902,6 +5011,8 @@ async def receive_events(
 
                 print("Thinking...")
 
+                controller.mark_request("speech_end")
+
                 await send_missed_note(ws)
 
                 await create_response(ws)
@@ -4927,6 +5038,7 @@ async def receive_events(
                 continue
 
             controller.reply_deadline = 0.0
+            controller.mark_request("first_audio")
 
             if not STREAMING_PLAYBACK:
                 response_audio.extend(base64.b64decode(delta))
@@ -5000,9 +5112,16 @@ async def receive_events(
 
                 continue
 
+            if controller.request is not None:
+                add_usage(controller.request["usage"], response.get("usage"))
+
             function_calls = [item for item in output if (item.get("type") == "function_call")]
 
             if function_calls:
+                controller.note_request(
+                    tools=(controller.request or {}).get("tools", [])
+                    + [item.get("name") for item in function_calls]
+                )
                 response_audio.clear()
 
                 player = controller.player
@@ -5061,6 +5180,9 @@ async def receive_events(
                 continue
 
             controller.response_active = False
+
+            controller.mark_request("reply_done")
+            controller.end_request("answered")
 
             status = response.get("status")
 
@@ -5162,6 +5284,31 @@ async def receive_events(
 # =========================================================
 
 
+def turn_detection_settings():
+    if TURN_DETECTION == "semantic_vad":
+        return {
+            "type": "semantic_vad",
+            "create_response": False,
+            "interrupt_response": False,
+        }
+
+    return {
+        "type": "server_vad",
+        "threshold": VAD_THRESHOLD,
+        "prefix_padding_ms": VAD_PREFIX_MS,
+        "silence_duration_ms": VAD_SILENCE_MS,
+        "create_response": False,
+        "interrupt_response": False,
+    }
+
+
+def noise_reduction_settings():
+    if NOISE_REDUCTION in ("near_field", "far_field"):
+        return {"noise_reduction": {"type": NOISE_REDUCTION}}
+
+    return {}
+
+
 async def configure_session(
     ws,
 ):
@@ -5209,6 +5356,9 @@ async def configure_session(
         "than agreeing for convenience. "
         "The phrase 'Hey Nexus' is the wake phrase and is not part of the "
         "substantive request. "
+        "If the audio is unclear, is only the wake phrase, or is not addressed "
+        "to you, say you did not catch it in a few words or stay silent. Never "
+        "guess at a request you did not hear. "
         f"The Dell's current local date and time at session creation is "
         f"{current_time_text}. This value may become stale. For any request "
         "that depends on the current date or time, call get_current_datetime. "
@@ -5455,14 +5605,8 @@ async def configure_session(
                                 "type": "audio/pcm",
                                 "rate": MODEL_RATE,
                             },
-                            "turn_detection": {
-                                "type": "server_vad",
-                                "threshold": VAD_THRESHOLD,
-                                "prefix_padding_ms": VAD_PREFIX_MS,
-                                "silence_duration_ms": VAD_SILENCE_MS,
-                                "create_response": False,
-                                "interrupt_response": False,
-                            },
+                            "turn_detection": turn_detection_settings(),
+                            **noise_reduction_settings(),
                         },
                         "output": {
                             "format": {

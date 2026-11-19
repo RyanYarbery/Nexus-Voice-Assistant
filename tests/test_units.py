@@ -42,6 +42,38 @@ def test_stream_resampler_chunked_equals_whole():
         assert step < 12000 * 2 * np.pi * 440 / new_rate * 1.2  # no clicks
 
 
+def test_stream_resampler_microphone_to_model_rate():
+    R = ns["StreamResampler"]
+    t = np.arange(16000) / 16000
+    sig = (np.sin(2 * np.pi * 440 * t) * 12000).astype(np.int16)
+    r = R(16000, 24000)
+    chunked = np.concatenate([r.process(sig[i : i + 1280]) for i in range(0, len(sig), 1280)])
+    whole = R(16000, 24000).process(sig)
+    assert abs(len(chunked) - 24000) <= 2 and np.array_equal(chunked, whole)
+    step = np.abs(np.diff(chunked[2000:].astype(float))).max()
+    assert step < 12000 * 2 * np.pi * 440 / 24000 * 1.2  # no clicks at block edges
+
+
+def test_usage_reports_are_added_up():
+    total = {}
+    add = ns["add_usage"]
+    add(total, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {"audio_tokens": 8}})
+    add(
+        total,
+        {
+            "input_tokens": 3,
+            "output_tokens": 1,
+            "input_token_details": {"audio_tokens": 2, "cached_tokens": 1},
+        },
+    )
+    assert total == {
+        "input_tokens": 13,
+        "output_tokens": 6,
+        "input_token_details": {"audio_tokens": 10, "cached_tokens": 1},
+    }
+    assert add(total, None) is total
+
+
 def test_format_duration_and_env_flag():
     f = ns["format_duration"]
     assert f(0) == "0 seconds" and f(61) == "1 minute 1 second" and f(3600) == "1 hour"
