@@ -82,7 +82,15 @@ class FakeStream:
 
 sd.InputStream = FakeStream
 sd.OutputStream = FakeStream
-sd.play = lambda *a, **k: time.sleep(0.01)
+played = []
+
+
+def _play(data, rate, **kwargs):
+    played.append(np.asarray(data).copy())
+    time.sleep(0.01)
+
+
+sd.play = _play
 sys.modules["sounddevice"] = sd
 
 for _name in (
@@ -109,6 +117,9 @@ ns["get_wake_score"] = lambda model, block: script["wake"]
 ns["speaker_similarity"] = lambda rec, emb, audio: script["speaker"]
 
 DEFAULTS = {
+    "NOTICE_TTS": "off",  # tones only: no speech synthesiser needed
+    "NOTICE_MIN_GAP_SECONDS": 0.0,
+    "STATUS_FILE": pathlib.Path(_tmp) / "status.json",
     "FOLLOWUP_SECONDS": 0.6,
     "ACTIVE_SPEECH_TIMEOUT_SECONDS": 1.0,
     "SOFT_VERIFY_SECONDS": 1.0,
@@ -216,9 +227,11 @@ async def _scenario(body):
     ns["clear_mic_queue"]()
     for k in written:
         written[k] = [] if isinstance(written[k], list) else 0
+    played.clear()
     script["wake"] = 0.0
     script["speaker"] = 0.6
-    proc = asyncio.create_task(ns["process_microphone"](ws, (None, None), controller))
+    controller.link.attach(ws)
+    proc = asyncio.create_task(ns["process_microphone"](controller.link, (None, None), controller))
     recv = asyncio.create_task(ns["receive_events"](ws, controller))
     try:
         await body(ws, controller)

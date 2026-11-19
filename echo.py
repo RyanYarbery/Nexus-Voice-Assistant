@@ -7,6 +7,7 @@ import base64
 import json
 import math
 import queue
+import shutil
 import subprocess
 import threading
 import time
@@ -48,7 +49,7 @@ from speechbrain.inference.speaker import SpeakerRecognition
 SETTINGS = {}
 
 
-def _setting(name, default, convert, doc):
+def _setting(name, default, convert, doc, secret=False):
     raw = os.environ.get(name)
     value = default
 
@@ -58,13 +59,13 @@ def _setting(name, default, convert, doc):
         except (TypeError, ValueError):
             print(f"WARNING: {name}={raw!r} is not valid; using {default!r}.")
 
-    SETTINGS[name] = {"value": value, "default": default, "doc": doc}
+    SETTINGS[name] = {"value": value, "default": default, "doc": doc, "secret": secret}
 
     return value
 
 
-def env_str(name, default, doc=""):
-    return _setting(name, default, str, doc)
+def env_str(name, default, doc="", secret=False):
+    return _setting(name, default, str, doc, secret)
 
 
 def env_float(name, default, doc=""):
@@ -377,6 +378,56 @@ ALARM_BEEP_GAP = 0.20
 ALARM_BEEP_COUNT = env_int("NEXUS_ALARM_BEEP_COUNT", 16, "Beeps when an alarm goes off.")
 ALARM_VOLUME = env_float("NEXUS_ALARM_VOLUME", 0.30, "Alarm beep volume, 0 to 1.")
 
+# --- Failing loudly -------------------------------------------------
+
+OFFLINE_NOTICES = env_flag(
+    "NEXUS_OFFLINE_NOTICES",
+    True,
+    "Play a short notice when the wake phrase is heard but Nexus cannot answer.",
+)
+NOTICE_MIN_GAP_SECONDS = env_float("NEXUS_NOTICE_MIN_GAP_SECONDS", 20, "Shortest time between two notices.")
+NOTICE_DIR = Path(
+    env_str(
+        "NEXUS_NOTICE_DIR",
+        str(BASE_DIR / "notices"),
+        "Folder of your own notice recordings (quota.wav, network.wav, error.wav ...).",
+    )
+)
+NOTICE_TTS = env_str(
+    "NEXUS_NOTICE_TTS",
+    "auto",
+    "Speech for notices: auto (espeak-ng if installed), off (tones only), or a command that writes WAV to stdout.",
+)
+
+ACCOUNT_RETRY_SECONDS = env_float(
+    "NEXUS_ACCOUNT_RETRY_SECONDS",
+    600,
+    "Wait between attempts when the account, key or model is the problem.",
+)
+NETWORK_PROBLEM_AFTER_FAILURES = env_int(
+    "NEXUS_NETWORK_PROBLEM_AFTER_FAILURES",
+    3,
+    "Failed connection attempts in a row before a network problem is reported.",
+)
+STATUS_OK_AFTER_SECONDS = env_float(
+    "NEXUS_STATUS_OK_AFTER_SECONDS", 5, "A connection counts as healthy once it has lasted this long."
+)
+STATUS_HEARTBEAT_SECONDS = 60
+
+_status_file = env_str(
+    "NEXUS_STATUS_FILE",
+    str(BASE_DIR / "status.json"),
+    'Health file for a watchdog to read; "off" for none.',
+)
+STATUS_FILE = None if _status_file.lower() in ("off", "none", "") else Path(_status_file)
+
+NTFY_URL = env_str(
+    "NEXUS_NTFY_URL",
+    "",
+    "ntfy topic address for push alerts when the status changes; empty for none.",
+    secret=True,
+)
+
 OPENAI_VOICE = env_str("NEXUS_VOICE", "marin", "OpenAI voice used for replies.")
 
 VAD_THRESHOLD = env_float("NEXUS_VAD_THRESHOLD", 0.5, "OpenAI speech detector sensitivity, 0 to 1.")
@@ -396,7 +447,8 @@ def describe_settings():
     for name in sorted(SETTINGS):
         entry = SETTINGS[name]
         mark = "*" if entry["value"] != entry["default"] else " "
-        lines.append(f"  {mark} {name}={entry['value']}")
+        shown = "(set)" if entry["secret"] and entry["value"] else entry["value"]
+        lines.append(f"  {mark} {name}={shown}")
 
     return lines
 
@@ -856,6 +908,366 @@ def close_reference_output():
 
     if output is not None:
         output.close()
+
+
+# =========================================================
+# STATUS, ALERTS AND SPOKEN NOTICES
+# =========================================================
+#
+# Nexus must never fail silently. Three things make a failure visible:
+#   - a status file that a watchdog (for example device-watch) can read;
+#   - an optional push message through ntfy when the status changes;
+#   - a short spoken or tone notice when someone says the wake phrase
+#     and Nexus cannot answer.
+
+ACCOUNT_PROBLEMS = ("quota", "auth", "model")
+
+PROBLEM_LABELS = {
+    "quota": "out of credit",
+    "auth": "API key rejected",
+    "model": "voice model not available",
+    "network": "cannot reach the voice service",
+    "speaker": "speaker output failing",
+    "microphone": "microphone stopped",
+}
+
+NOTICE_TEXT = {
+    "quota": "The OpenAI account is out of credit.",
+    "auth": "The OpenAI key was rejected.",
+    "model": "The voice model is no longer available.",
+    "network": "I cannot reach OpenAI right now.",
+    "starting": "I am still connecting.",
+    "error": "Something went wrong. Ask me again.",
+    "missed": "An alarm or timer was missed while I was off.",
+}
+
+# Fallback when no speech synthesiser is installed: (frequency Hz, seconds).
+NOTICE_TONES = {
+    "error": [(440, 0.18), (330, 0.30)],
+    "missed": [(660, 0.15), (660, 0.15), (440, 0.30)],
+}
+NOTICE_TONES_DEFAULT = [(660, 0.20), (520, 0.20), (392, 0.35)]
+
+# Extra ways to deliver a notice. Each hook is an async function
+# (kind, text) -> bool; the first one that returns True has handled it.
+NOTICE_HOOKS = []
+
+status = {
+    "state": "starting",
+    "problem": None,
+    "detail": "",
+    "since": datetime.now().astimezone().isoformat(timespec="seconds"),
+}
+_last_notice_at = 0.0
+
+
+def classify_failure(text):
+    """Sort a connection failure into quota, auth, model or network."""
+    lower = str(text).lower()
+
+    if any(
+        mark in lower for mark in ("insufficient_quota", "credit", "billing", "exceeded your current quota")
+    ):
+        return "quota"
+
+    if any(
+        mark in lower
+        for mark in (
+            "invalid_api_key",
+            "incorrect api key",
+            "api_key is not set",
+            "authentication",
+            "unauthorized",
+            "http 401",
+            "http 403",
+        )
+    ):
+        return "auth"
+
+    if any(
+        mark in lower
+        for mark in ("model_not_found", "does not exist", "deprecated", "http 404", "access to model")
+    ):
+        return "model"
+
+    return "network"
+
+
+def status_summary():
+    if status["state"] != "problem":
+        return status["state"]
+
+    label = PROBLEM_LABELS.get(status["problem"], status["problem"])
+
+    return f"problem: {label} since {status['since']}"
+
+
+def write_status_file():
+    if STATUS_FILE is None:
+        return
+
+    data = dict(status)
+    data["summary"] = status_summary()
+    data["updated"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    data["version"] = code_version()
+    data["pid"] = os.getpid()
+
+    try:
+        temporary = STATUS_FILE.with_name(STATUS_FILE.name + ".tmp")
+        temporary.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(STATUS_FILE)
+    except OSError as exc:
+        print(f"Could not write the status file {STATUS_FILE}: {exc}")
+
+
+def _post_ntfy(title, body):
+    try:
+        request = urllib.request.Request(
+            NTFY_URL,
+            data=body.encode("utf-8"),
+            headers={"Title": title, "User-Agent": HTTP_USER_AGENT},
+            method="POST",
+        )
+
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS):
+            pass
+    except Exception as exc:
+        print(f"Could not send the push alert: {type(exc).__name__}: {exc}")
+
+
+def send_alert(title, body):
+    """Push a message to the owner's phone. Does nothing unless NEXUS_NTFY_URL is set."""
+    if not NTFY_URL:
+        return
+
+    threading.Thread(target=_post_ntfy, args=(title, body), daemon=True).start()
+
+
+def set_status(state, problem=None, detail=""):
+    """Record the health of the assistant; log and alert when it changes."""
+    previous = (status["state"], status["problem"])
+    changed = previous != (state, problem)
+
+    status["detail"] = str(detail)[:300]
+
+    if changed:
+        status["state"] = state
+        status["problem"] = problem
+        status["since"] = datetime.now().astimezone().isoformat(timespec="seconds")
+
+        print(
+            f"Status: {status_summary()}" + (f" ({status['detail']})" if status["detail"] else ""), flush=True
+        )
+
+        if state == "problem":
+            send_alert("Nexus problem", f"{PROBLEM_LABELS.get(problem, problem)}. {status['detail']}")
+        elif previous[0] == "problem":
+            send_alert("Nexus recovered", f"Was: {PROBLEM_LABELS.get(previous[1], previous[1])}.")
+
+    write_status_file()
+
+
+async def status_heartbeat():
+    """Rewrite the status file every minute so a stale file means a hung process."""
+    while True:
+        write_status_file()
+        await asyncio.sleep(STATUS_HEARTBEAT_SECONDS)
+
+
+def hard_exit(reason):
+    """Leave at once so the service manager starts a clean process.
+
+    Raising is not enough: audio and model shutdown can hang before
+    Python exits.
+    """
+    print(f"FATAL: {reason}. Exiting for a clean restart.", flush=True)
+    os._exit(1)
+
+
+def _tone_sequence(tones, volume=0.25):
+    parts = []
+
+    for frequency, seconds in tones:
+        t = np.arange(int(OUTPUT_RATE * seconds), dtype=np.float32) / OUTPUT_RATE
+        tone = np.sin(2 * np.pi * frequency * t) * volume * 32767
+        fade = min(len(tone) // 2, int(OUTPUT_RATE * 0.01))
+
+        if fade:
+            ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)
+            tone[:fade] *= ramp
+            tone[-fade:] *= ramp[::-1]
+
+        parts.append(tone.astype(np.int16))
+        parts.append(np.zeros(int(OUTPUT_RATE * 0.06), dtype=np.int16))
+
+    return np.concatenate(parts)
+
+
+def _wav_bytes_to_pcm(data):
+    """Decode a 16-bit PCM WAV (as a speech synthesiser writes to stdout) to mono at OUTPUT_RATE."""
+    if len(data) < 44 or data[:4] != b"RIFF":
+        raise ValueError("not a WAV stream")
+
+    channels = int.from_bytes(data[22:24], "little") or 1
+    rate = int.from_bytes(data[24:28], "little")
+    start = data.find(b"data")
+
+    if start < 0 or rate <= 0:
+        raise ValueError("WAV stream has no audio")
+
+    body = data[start + 8 :]
+    pcm = np.frombuffer(body[: len(body) // 2 * 2], dtype=np.int16)
+
+    if channels > 1:
+        pcm = pcm[: len(pcm) // channels * channels].reshape(-1, channels).mean(axis=1).astype(np.int16)
+
+    return resample_int16(pcm, rate, OUTPUT_RATE)
+
+
+def notice_audio(kind, text):
+    """Audio for a notice: your own recording, a local synthesiser, or tones.
+
+    Nothing here needs the network, so it works when OpenAI does not.
+    """
+    recording = NOTICE_DIR / f"{kind}.wav"
+
+    if recording.exists():
+        try:
+            return _wav_bytes_to_pcm(recording.read_bytes())
+        except Exception as exc:
+            print(f"Could not use {recording}: {exc}")
+
+    if NOTICE_TTS != "off":
+        if NOTICE_TTS == "auto":
+            command = shutil.which("espeak-ng") or shutil.which("espeak")
+            arguments = [command, "--stdout", text] if command else None
+        else:
+            arguments = [NOTICE_TTS, text]
+
+        if arguments:
+            try:
+                completed = subprocess.run(
+                    arguments,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=15,
+                    check=True,
+                )
+
+                return _wav_bytes_to_pcm(completed.stdout)
+            except Exception as exc:
+                print(f"Speech synthesiser failed ({type(exc).__name__}: {exc}); using tones.")
+
+    return _tone_sequence(NOTICE_TONES.get(kind, NOTICE_TONES_DEFAULT))
+
+
+async def play_local_audio(pcm_48k):
+    """Play locally generated audio (a notice) through the speaker."""
+    async with playback_lock():
+        barge_in_event.clear()
+        assistant_speaking.set()
+
+        try:
+            if reference_output is not None:
+                reference_output.write(resample_int16(pcm_48k, OUTPUT_RATE, AEC_REFERENCE_RATE))
+
+            await asyncio.to_thread(
+                sd.play,
+                pcm_48k,
+                OUTPUT_RATE,
+                device=OUTPUT_DEVICE,
+                blocking=True,
+            )
+        finally:
+            assistant_speaking.clear()
+            barge_in_event.clear()
+            clear_mic_queue()
+
+
+async def play_notice(kind, text=None):
+    """Tell whoever is in the room why Nexus cannot answer. Returns True if something was played."""
+    global _last_notice_at
+
+    if not OFFLINE_NOTICES:
+        return False
+
+    now = time.monotonic()
+
+    if now - _last_notice_at < NOTICE_MIN_GAP_SECONDS:
+        return False
+
+    _last_notice_at = now
+
+    text = text or NOTICE_TEXT.get(kind, NOTICE_TEXT["error"])
+
+    print(f"Notice ({kind}): {text}")
+
+    for hook in list(NOTICE_HOOKS):
+        try:
+            if await hook(kind, text):
+                return True
+        except Exception as exc:
+            print(f"Notice hook failed: {type(exc).__name__}: {exc}")
+
+    try:
+        pcm = await asyncio.to_thread(notice_audio, kind, text)
+        await play_local_audio(pcm)
+    except Exception as exc:
+        print(f"Could not play the notice: {type(exc).__name__}: {exc}")
+        return False
+
+    return True
+
+
+class Link:
+    """The current connection to the voice service, or none.
+
+    The microphone loop lives for the whole process and talks to the
+    service through this object, so it keeps listening for the wake
+    phrase while the connection is down.
+    """
+
+    def __init__(self):
+        self.ws = None
+        self.failed = None
+        self.failure = None
+
+        # Why there is no connection: None, "starting", or a
+        # classify_failure() kind.
+        self.problem = "starting"
+        self.failures = 0
+
+        # Set from an error event so the close that follows is classified
+        # correctly even when its own reason is generic.
+        self.last_error_kind = None
+
+    @property
+    def online(self):
+        return self.ws is not None
+
+    def attach(self, ws):
+        self.failed = asyncio.Event()
+        self.failure = None
+        self.ws = ws
+
+    def detach(self):
+        self.ws = None
+
+    def fail(self, exc):
+        """Called by the microphone loop when a send fails."""
+        if self.failure is None:
+            self.failure = exc
+
+        if self.failed is not None:
+            self.failed.set()
+
+    async def send(self, payload):
+        ws = self.ws
+
+        if ws is None:
+            raise ConnectionError("not connected to the voice service")
+
+        await ws.send(payload)
 
 
 # =========================================================
@@ -3335,6 +3747,9 @@ class NexusController:
         self.speech_start_block_index = None
 
         self.wake_gate = WakeGate()
+        self.link = Link()
+        self.was_speaking = False
+        self.offline_wake = False
 
         # Highest wake scores heard while Nexus was audible: per reply
         # (always logged) and per debug interval.
@@ -3603,328 +4018,376 @@ async def verify_speaker(
 
 
 async def process_microphone(
-    ws,
+    link,
     wake_models,
     controller,
 ):
-    wake_model_ch0, wake_model_ch1 = wake_models
+    """Consume microphone blocks for the life of the process.
 
-    was_speaking = False
-
+    `link` is the connection to the voice service, which may be down. A
+    failed send must never end this loop: the block is dropped, the
+    connection is reported as failed, and listening continues.
+    """
     while True:
         block = await queue_get(mic_queue)
 
-        ch0, ch1 = block
-
-        speaking = assistant_speaking.is_set()
-
-        if speaking != was_speaking:
-            was_speaking = speaking
-
-            if not WAKE_ALWAYS_SCORE:
-                # Old behaviour: the models are only fed while waiting
-                # or speaking, so clear their score history on a change.
-                reset_wake_detectors(wake_models)
-
-            if speaking:
-                controller.barge_peak0 = 0.0
-                controller.barge_peak1 = 0.0
-                controller.barge_debug_peak0 = 0.0
-                controller.barge_debug_peak1 = 0.0
-                controller.barge_debug_printed = time.monotonic()
-            else:
-                print(
-                    f"Barge-in peak while speaking: CH0={controller.barge_peak0:.3f} "
-                    f"CH1={controller.barge_peak1:.3f} (threshold {BARGE_WAKE_THRESHOLD}, {BARGE_CHANNEL})"
-                )
-
-        # The wake models hear every block in every state, so they never
-        # hold a stale phrase when listening resumes. What a hit means
-        # is decided below from the state.
-        score0 = 0.0
-        score1 = 0.0
-
-        if WAKE_ALWAYS_SCORE or speaking or controller.state == AssistantState.WAIT_WAKE:
-            score0 = get_wake_score(
-                wake_model_ch0,
-                ch0,
-            )
-
-            score1 = get_wake_score(
-                wake_model_ch1,
-                ch1,
-            )
-
-            controller.wake_gate.observe(max(score0, score1))
-
-        if speaking:
-            handle_block_while_speaking(
+        try:
+            await handle_microphone_block(
+                link,
+                wake_models,
                 controller,
                 block,
-                score0,
-                score1,
-            )
-            continue
-
-        if controller.state == AssistantState.WAIT_WAKE:
-            wake_preroll.append(block)
-
-            if time.monotonic() < controller.wake_cooldown_until:
-                continue
-
-            if not controller.wake_gate.armed:
-                continue
-
-            best_score = max(
-                score0,
-                score1,
             )
 
-            if WAKE_DEBUG and best_score >= 0.02:
-                print(
-                    f"WAKE DEBUG CH0={score0:.3f} CH1={score1:.3f} best={best_score:.3f}",
-                    flush=True,
-                )
+        except asyncio.CancelledError:
+            raise
 
-            if best_score < WAKE_THRESHOLD:
-                continue
+        except Exception as exc:
+            if link.online:
+                print(f"Microphone step failed: {type(exc).__name__}: {exc}")
+                link.fail(exc)
 
-            wake_winner = 0 if score0 >= score1 else 1
+            if controller.state != AssistantState.WAIT_WAKE:
+                controller.return_to_wake()
 
-            controller.wake_gate.disarm()
 
-            print()
-            print("*** HEY NEXUS DETECTED ***")
-            print(f"Wake CH0: {score0:.3f}   CH1: {score1:.3f}   winner: CH{wake_winner}")
+async def handle_microphone_block(
+    ws,
+    wake_models,
+    controller,
+    block,
+):
+    wake_model_ch0, wake_model_ch1 = wake_models
 
-            controller.verify_blocks = [(b[0].copy(), b[1].copy()) for b in wake_preroll]
+    ch0, ch1 = block
 
-            wake_preroll.clear()
+    speaking = assistant_speaking.is_set()
 
-            if SPEAKER_VERIFY_MODE == "strict":
-                print("Checking speaker on both channels...")
-                controller.state = AssistantState.VERIFY_WAKE
-                continue
+    if speaking != controller.was_speaking:
+        controller.was_speaking = speaking
 
-            # Soft/off: start streaming now. The pre-roll (which
-            # contains the wake phrase) goes first so the server's VAD
-            # sees the start of the utterance.
-            controller.enter_active(
-                wake_winner,
-                origin="wake",
-                verification_pending=(SPEAKER_VERIFY_MODE == "soft"),
+        if not WAKE_ALWAYS_SCORE:
+            # Old behaviour: the models are only fed while waiting
+            # or speaking, so clear their score history on a change.
+            reset_wake_detectors(wake_models)
+
+        if speaking:
+            controller.barge_peak0 = 0.0
+            controller.barge_peak1 = 0.0
+            controller.barge_debug_peak0 = 0.0
+            controller.barge_debug_peak1 = 0.0
+            controller.barge_debug_printed = time.monotonic()
+        else:
+            print(
+                f"Barge-in peak while speaking: CH0={controller.barge_peak0:.3f} "
+                f"CH1={controller.barge_peak1:.3f} (threshold {BARGE_WAKE_THRESHOLD}, {BARGE_CHANNEL})"
             )
 
-            controller.pending_send_blocks = select_channel_blocks(
-                controller.verify_blocks,
-                wake_winner,
+    # The wake models hear every block in every state, so they never
+    # hold a stale phrase when listening resumes. What a hit means
+    # is decided below from the state.
+    score0 = 0.0
+    score1 = 0.0
+
+    if WAKE_ALWAYS_SCORE or speaking or controller.state == AssistantState.WAIT_WAKE:
+        score0 = get_wake_score(
+            wake_model_ch0,
+            ch0,
+        )
+
+        score1 = get_wake_score(
+            wake_model_ch1,
+            ch1,
+        )
+
+        controller.wake_gate.observe(max(score0, score1))
+
+    if speaking:
+        handle_block_while_speaking(
+            controller,
+            block,
+            score0,
+            score1,
+        )
+        return
+
+    if controller.state == AssistantState.WAIT_WAKE:
+        wake_preroll.append(block)
+
+        if time.monotonic() < controller.wake_cooldown_until:
+            return
+
+        if not controller.wake_gate.armed:
+            return
+
+        best_score = max(
+            score0,
+            score1,
+        )
+
+        if WAKE_DEBUG and best_score >= 0.02:
+            print(
+                f"WAKE DEBUG CH0={score0:.3f} CH1={score1:.3f} best={best_score:.3f}",
+                flush=True,
             )
-            controller.pending_input_clear = True
 
-            if SPEAKER_VERIFY_MODE == "soft":
-                print("Listening for request; verifying speaker in parallel...")
-            else:
-                controller.verify_blocks = []
-                print("Listening for request...")
+        if best_score < WAKE_THRESHOLD:
+            return
 
-            continue
+        wake_winner = 0 if score0 >= score1 else 1
 
-        if controller.state == AssistantState.VERIFY_WAKE:
-            controller.verify_blocks.append(block)
+        controller.wake_gate.disarm()
 
-            if not blocks_have_seconds(
-                controller.verify_blocks,
-                SPEAKER_VERIFY_SECONDS,
-            ):
-                continue
+        print()
+        print("*** HEY NEXUS DETECTED ***")
+        print(f"Wake CH0: {score0:.3f}   CH1: {score1:.3f}   winner: CH{wake_winner}")
 
-            similarity0, similarity1 = await score_speaker(
-                controller,
-                controller.verify_blocks,
-            )
+        controller.verify_blocks = [(b[0].copy(), b[1].copy()) for b in wake_preroll]
 
-            winner = 0 if similarity0 >= similarity1 else 1
-            best_similarity = max(
-                similarity0,
-                similarity1,
-            )
+        wake_preroll.clear()
 
-            print(f"Speaker CH0: {similarity0:.3f}   CH1: {similarity1:.3f}   winner: CH{winner}")
+        controller.offline_wake = not ws.online
 
-            if best_similarity < SPEAKER_THRESHOLD:
-                print("Speaker rejected.")
-                controller.return_to_wake(rejected=True)
-                continue
+        if controller.offline_wake and SPEAKER_VERIFY_MODE == "off":
+            controller.verify_blocks = []
+            await play_notice(ws.problem or "network")
+            controller.return_to_wake()
+            return
 
-            print("Speaker accepted.")
-            print(f"Using microphone channel {winner}.")
+        if SPEAKER_VERIFY_MODE == "strict" or controller.offline_wake:
+            # Offline, nothing is streamed: check the speaker first so
+            # a stray sound does not set off the notice.
+            print("Checking speaker on both channels...")
+            controller.state = AssistantState.VERIFY_WAKE
+            return
+
+        # Soft/off: start streaming now. The pre-roll (which
+        # contains the wake phrase) goes first so the server's VAD
+        # sees the start of the utterance.
+        controller.enter_active(
+            wake_winner,
+            origin="wake",
+            verification_pending=(SPEAKER_VERIFY_MODE == "soft"),
+        )
+
+        controller.pending_send_blocks = select_channel_blocks(
+            controller.verify_blocks,
+            wake_winner,
+        )
+        controller.pending_input_clear = True
+
+        if SPEAKER_VERIFY_MODE == "soft":
+            print("Listening for request; verifying speaker in parallel...")
+        else:
+            controller.verify_blocks = []
             print("Listening for request...")
 
-            controller.enter_active(winner)
+        return
+
+    if controller.state == AssistantState.VERIFY_WAKE:
+        controller.verify_blocks.append(block)
+
+        if not blocks_have_seconds(
+            controller.verify_blocks,
+            SPEAKER_VERIFY_SECONDS,
+        ):
+            return
+
+        similarity0, similarity1 = await score_speaker(
+            controller,
+            controller.verify_blocks,
+        )
+
+        winner = 0 if similarity0 >= similarity1 else 1
+        best_similarity = max(
+            similarity0,
+            similarity1,
+        )
+
+        print(f"Speaker CH0: {similarity0:.3f}   CH1: {similarity1:.3f}   winner: CH{winner}")
+
+        if best_similarity < SPEAKER_THRESHOLD:
+            print("Speaker rejected.")
+            controller.return_to_wake(rejected=True)
+            return
+
+        print("Speaker accepted.")
+
+        if controller.offline_wake or not ws.online:
+            controller.offline_wake = False
+            controller.verify_blocks = []
+            await play_notice(ws.problem or "network")
+            controller.return_to_wake()
+            return
+
+        print(f"Using microphone channel {winner}.")
+        print("Listening for request...")
+
+        controller.enter_active(winner)
+
+        await clear_openai_input(ws)
+        await send_blocks_to_openai(
+            ws,
+            select_channel_blocks(
+                controller.verify_blocks,
+                winner,
+            ),
+        )
+
+        controller.verify_blocks = []
+        return
+
+    if controller.state == AssistantState.ACTIVE:
+        if not controller.speech_started_seen and time.monotonic() >= controller.active_deadline:
+            if controller.active_origin == "wake":
+                print("No speech detected; stopping microphone upload.")
+            else:
+                print("Follow-up window closed.")
+
+            try:
+                await clear_openai_input(ws)
+            except Exception:
+                pass
+
+            controller.return_to_wake()
+            return
+
+        if controller.pending_input_clear:
+            controller.pending_input_clear = False
+            await clear_openai_input(ws)
+
+        if controller.pending_send_blocks:
+            blocks = controller.pending_send_blocks
+            controller.pending_send_blocks = []
+            await send_blocks_to_openai(
+                ws,
+                blocks,
+            )
+
+        controller.recent_blocks.append(block)
+
+        if controller.verification_pending:
+            # Collect from the start for a wake-word activation
+            # (the pre-roll holds the phrase); for follow-ups,
+            # wait until the server reports speech so silence is
+            # not what gets judged.
+            if (
+                controller.active_origin == "wake"
+                or controller.speech_started_seen
+                or controller.verify_blocks
+            ):
+                controller.verify_blocks.append(block)
+
+            speech_index = controller.speech_start_block_index
+
+            if (
+                controller.speech_started_seen
+                and speech_index is not None
+                and blocks_have_seconds(
+                    controller.verify_blocks,
+                    SOFT_VERIFY_SECONDS,
+                )
+                and blocks_have_seconds(
+                    controller.verify_blocks[speech_index:],
+                    SOFT_VERIFY_SPEECH_SECONDS,
+                )
+            ):
+                accepted = await verify_speaker(
+                    ws,
+                    controller,
+                    "Request",
+                )
+
+                if not accepted:
+                    return
+
+        await send_pcm_to_openai(
+            ws,
+            block[controller.active_channel],
+        )
+        return
+
+    if controller.state == AssistantState.WAIT_RESPONSE:
+        # Kept so speech right after a barge-in is not lost.
+        controller.wait_blocks.append(block)
+        return
+
+    if controller.state == AssistantState.FOLLOWUP:
+        # Strict mode only.
+        if time.monotonic() >= controller.followup_deadline:
+            controller.return_to_wake()
+            wake_preroll.append(block)
+            return
+
+        controller.followup_blocks.append(block)
+
+        if not blocks_have_seconds(
+            controller.followup_blocks,
+            FOLLOWUP_VERIFY_SECONDS,
+        ):
+            return
+
+        similarity0, similarity1 = await score_speaker(
+            controller,
+            controller.followup_blocks,
+        )
+
+        winner = 0 if similarity0 >= similarity1 else 1
+        best_similarity = max(
+            similarity0,
+            similarity1,
+        )
+
+        print(f"Follow-up CH0: {similarity0:.3f}   CH1: {similarity1:.3f}   winner: CH{winner}")
+
+        if best_similarity >= SPEAKER_THRESHOLD:
+            print("Follow-up speaker accepted.")
+            print(f"Using microphone channel {winner}.")
+
+            controller.enter_active(
+                winner,
+                origin="followup",
+            )
 
             await clear_openai_input(ws)
             await send_blocks_to_openai(
                 ws,
                 select_channel_blocks(
-                    controller.verify_blocks,
+                    controller.followup_blocks,
                     winner,
                 ),
             )
 
-            controller.verify_blocks = []
-            continue
+            controller.followup_blocks.clear()
+            print("Listening for follow-up...")
+            return
 
-        if controller.state == AssistantState.ACTIVE:
-            if not controller.speech_started_seen and time.monotonic() >= controller.active_deadline:
-                if controller.active_origin == "wake":
-                    print("No speech detected; stopping microphone upload.")
-                else:
-                    print("Follow-up window closed.")
+        print("Background/unknown speaker ignored.")
 
-                try:
-                    await clear_openai_input(ws)
-                except Exception:
-                    pass
+        overlap_samples = int(FOLLOWUP_OVERLAP_SECONDS * INPUT_RATE)
 
-                controller.return_to_wake()
-                continue
-
-            if controller.pending_input_clear:
-                controller.pending_input_clear = False
-                await clear_openai_input(ws)
-
-            if controller.pending_send_blocks:
-                blocks = controller.pending_send_blocks
-                controller.pending_send_blocks = []
-                await send_blocks_to_openai(
-                    ws,
-                    blocks,
-                )
-
-            controller.recent_blocks.append(block)
-
-            if controller.verification_pending:
-                # Collect from the start for a wake-word activation
-                # (the pre-roll holds the phrase); for follow-ups,
-                # wait until the server reports speech so silence is
-                # not what gets judged.
-                if (
-                    controller.active_origin == "wake"
-                    or controller.speech_started_seen
-                    or controller.verify_blocks
-                ):
-                    controller.verify_blocks.append(block)
-
-                speech_index = controller.speech_start_block_index
-
-                if (
-                    controller.speech_started_seen
-                    and speech_index is not None
-                    and blocks_have_seconds(
-                        controller.verify_blocks,
-                        SOFT_VERIFY_SECONDS,
-                    )
-                    and blocks_have_seconds(
-                        controller.verify_blocks[speech_index:],
-                        SOFT_VERIFY_SPEECH_SECONDS,
-                    )
-                ):
-                    accepted = await verify_speaker(
-                        ws,
-                        controller,
-                        "Request",
-                    )
-
-                    if not accepted:
-                        continue
-
-            await send_pcm_to_openai(
-                ws,
-                block[controller.active_channel],
-            )
-            continue
-
-        if controller.state == AssistantState.WAIT_RESPONSE:
-            # Kept so speech right after a barge-in is not lost.
-            controller.wait_blocks.append(block)
-            continue
-
-        if controller.state == AssistantState.FOLLOWUP:
-            # Strict mode only.
-            if time.monotonic() >= controller.followup_deadline:
-                controller.return_to_wake()
-                wake_preroll.append(block)
-                continue
-
-            controller.followup_blocks.append(block)
-
-            if not blocks_have_seconds(
+        audio0 = np.concatenate(
+            select_channel_blocks(
                 controller.followup_blocks,
-                FOLLOWUP_VERIFY_SECONDS,
-            ):
-                continue
-
-            similarity0, similarity1 = await score_speaker(
-                controller,
+                0,
+            )
+        )
+        audio1 = np.concatenate(
+            select_channel_blocks(
                 controller.followup_blocks,
+                1,
             )
+        )
 
-            winner = 0 if similarity0 >= similarity1 else 1
-            best_similarity = max(
-                similarity0,
-                similarity1,
-            )
-
-            print(f"Follow-up CH0: {similarity0:.3f}   CH1: {similarity1:.3f}   winner: CH{winner}")
-
-            if best_similarity >= SPEAKER_THRESHOLD:
-                print("Follow-up speaker accepted.")
-                print(f"Using microphone channel {winner}.")
-
-                controller.enter_active(
-                    winner,
-                    origin="followup",
+        if len(audio0) > overlap_samples:
+            controller.followup_blocks = [
+                (
+                    audio0[-overlap_samples:].copy(),
+                    audio1[-overlap_samples:].copy(),
                 )
-
-                await clear_openai_input(ws)
-                await send_blocks_to_openai(
-                    ws,
-                    select_channel_blocks(
-                        controller.followup_blocks,
-                        winner,
-                    ),
-                )
-
-                controller.followup_blocks.clear()
-                print("Listening for follow-up...")
-                continue
-
-            print("Background/unknown speaker ignored.")
-
-            overlap_samples = int(FOLLOWUP_OVERLAP_SECONDS * INPUT_RATE)
-
-            audio0 = np.concatenate(
-                select_channel_blocks(
-                    controller.followup_blocks,
-                    0,
-                )
-            )
-            audio1 = np.concatenate(
-                select_channel_blocks(
-                    controller.followup_blocks,
-                    1,
-                )
-            )
-
-            if len(audio0) > overlap_samples:
-                controller.followup_blocks = [
-                    (
-                        audio0[-overlap_samples:].copy(),
-                        audio1[-overlap_samples:].copy(),
-                    )
-                ]
-            else:
-                controller.followup_blocks.clear()
+            ]
+        else:
+            controller.followup_blocks.clear()
 
 
 # =========================================================
@@ -4198,6 +4661,13 @@ async def receive_events(
 
             if "maximum duration" in error_message.lower():
                 raise ConnectionError(error_message)
+
+            error_kind = classify_failure(f"{error.get('code', '')} {error.get('type', '')} {error_message}")
+
+            if error_kind in ACCOUNT_PROBLEMS:
+                # The server usually closes the socket next; make sure
+                # that close is treated as an account problem.
+                controller.link.last_error_kind = error_kind
 
             controller.response_active = False
 
@@ -4530,9 +5000,13 @@ async def configure_session(
 
 async def run_connection(
     api_key,
-    wake_models,
     controller,
 ):
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+
+    link = controller.link
+
     url = f"wss://api.openai.com/v1/realtime?model={OPENAI_MODEL}"
 
     headers = {"Authorization": f"Bearer {api_key}"}
@@ -4545,53 +5019,57 @@ async def run_connection(
         ping_timeout=PING_TIMEOUT_SECONDS,
         close_timeout=3,
     ) as ws:
-        print("Connected to OpenAI Realtime.")
-
         controller.reset_for_connection()
 
-        await configure_session(ws)
+        link.attach(ws)
 
-        processor = asyncio.create_task(
-            process_microphone(
-                ws,
-                wake_models,
-                controller,
-            )
-        )
+        receiver = None
+        failure = None
+        settled = None
 
-        receiver = asyncio.create_task(
-            receive_events(
-                ws,
-                controller,
-            )
-        )
+        async def mark_healthy():
+            # An account problem lets the session start and closes it a
+            # moment later, so "connected" only counts once it has lasted.
+            await asyncio.sleep(STATUS_OK_AFTER_SECONDS)
 
-        tasks = [
-            processor,
-            receiver,
-        ]
+            if link.problem is not None:
+                print("Connected to OpenAI Realtime.")
+
+            link.problem = None
+            link.failures = 0
+            set_status("ok")
 
         try:
-            # FIRST_COMPLETED, not FIRST_EXCEPTION: when the server
-            # closes the socket cleanly, receive_events() returns
-            # without raising. Waiting only for exceptions would leave
-            # Nexus idle on a dead connection until the next wake-word
-            # attempt tried to send and failed.
-            done, pending = await asyncio.wait(
-                tasks,
-                return_when=(asyncio.FIRST_COMPLETED),
+            await configure_session(ws)
+
+            receiver = asyncio.create_task(
+                receive_events(
+                    ws,
+                    controller,
+                )
             )
 
-            for task in done:
-                exc = task.exception()
+            failure = asyncio.create_task(link.failed.wait())
+            settled = asyncio.create_task(mark_healthy())
 
-                if exc is not None:
-                    raise exc
+            # FIRST_COMPLETED: when the server closes the socket cleanly,
+            # receive_events() returns without raising.
+            done, pending = await asyncio.wait(
+                [receiver, failure],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
 
-            # Only the receiver can finish without an exception, and
-            # that means the Realtime socket was closed by the server.
+            if receiver in done and receiver.exception() is not None:
+                raise receiver.exception()
+
+            if failure in done and link.failure is not None:
+                raise link.failure
 
         finally:
+            link.detach()
+
+            tasks = [task for task in (receiver, failure, settled) if task is not None]
+
             for task in tasks:
                 task.cancel()
 
@@ -4610,46 +5088,33 @@ async def run_connection(
 
 async def connection_manager(
     api_key,
-    wake_models,
     controller,
 ):
+    link = controller.link
+
     delay = RECONNECT_INITIAL_SECONDS
 
     consecutive_handshake_failures = 0
     max_handshake_failures = 3
 
     while True:
-        connection_started = None
+        connection_started = time.monotonic()
+        link.last_error_kind = None
 
         try:
-            connection_started = time.monotonic()
-
             await run_connection(
                 api_key,
-                wake_models,
                 controller,
             )
 
-            print("Realtime connection closed.")
-
+            failure_text = "connection closed by the server"
             consecutive_handshake_failures = 0
-
-            if time.monotonic() - connection_started >= 30:
-                delay = RECONNECT_INITIAL_SECONDS
 
         except asyncio.CancelledError:
             raise
 
         except Exception as exc:
-            connection_elapsed = (
-                time.monotonic() - connection_started if connection_started is not None else 0.0
-            )
-
-            print()
-
-            print("Realtime connection lost:")
-
-            print(f"{type(exc).__name__}: {exc}")
+            failure_text = f"{type(exc).__name__}: {exc}"
 
             opening_handshake_timeout = (
                 isinstance(exc, TimeoutError) and "opening handshake" in str(exc).lower()
@@ -4658,44 +5123,57 @@ async def connection_manager(
             if opening_handshake_timeout:
                 consecutive_handshake_failures += 1
 
-                print(
-                    "Realtime opening-handshake failure "
-                    f"{consecutive_handshake_failures}/"
-                    f"{max_handshake_failures}."
-                )
-
                 if consecutive_handshake_failures >= max_handshake_failures:
-                    print(
-                        "Repeated Realtime handshake failures; forcing a clean systemd restart.",
-                        flush=True,
-                    )
-
-                    # Raising an exception is insufficient here because
-                    # audio/model shutdown can hang before Python exits.
-                    # Exit immediately; nexus.service uses Restart=always
-                    # and will replace the entire process group.
-                    os._exit(1)
-
+                    hard_exit("repeated Realtime handshake failures")
             else:
                 consecutive_handshake_failures = 0
 
-            if connection_elapsed >= 30:
-                delay = RECONNECT_INITIAL_SECONDS
+        connection_elapsed = time.monotonic() - connection_started
 
-                consecutive_handshake_failures = 0
+        kind = link.last_error_kind or classify_failure(failure_text)
 
-        controller.reset_for_connection()
+        if connection_elapsed >= 30:
+            delay = RECONNECT_INITIAL_SECONDS
+            consecutive_handshake_failures = 0
 
-        print(f"Reconnecting in {delay} second{'' if delay == 1 else 's'}...")
+        if connection_elapsed >= 30 and kind == "network":
+            # A session that ran and then ended (the hourly session
+            # limit, or a brief drop) is not a problem yet.
+            print(f"Realtime session ended ({failure_text}); reconnecting.")
+            wait = RECONNECT_INITIAL_SECONDS
 
-        await asyncio.sleep(delay)
+        else:
+            first = link.problem != kind
 
-        print("Attempting Realtime connection...")
+            link.problem = kind
+            link.failures += 1
 
-        delay = min(
-            delay * 2,
-            RECONNECT_MAX_SECONDS,
-        )
+            if kind in ACCOUNT_PROBLEMS:
+                wait = ACCOUNT_RETRY_SECONDS
+            else:
+                wait = delay
+                delay = min(
+                    delay * 2,
+                    RECONNECT_MAX_SECONDS,
+                )
+
+            if first:
+                # One line when the state changes, not five per attempt.
+                print()
+                print(f"Realtime connection lost: {failure_text}")
+                print(
+                    f"Cause: {PROBLEM_LABELS[kind]}. Retrying every {wait:g} s"
+                    + ("." if kind in ACCOUNT_PROBLEMS else f", up to every {RECONNECT_MAX_SECONDS} s.")
+                )
+
+            if kind in ACCOUNT_PROBLEMS or link.failures >= NETWORK_PROBLEM_AFTER_FAILURES:
+                set_status(
+                    "problem",
+                    kind,
+                    failure_text,
+                )
+
+        await asyncio.sleep(wait)
 
 
 # =========================================================
@@ -4707,7 +5185,7 @@ async def main():
     api_key = os.environ.get("OPENAI_API_KEY")
 
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set")
+        print("WARNING: OPENAI_API_KEY is not set. Nexus will listen and say so, but cannot answer.")
 
     print(f"Input:  {INPUT_DEVICE} - {sd.query_devices(INPUT_DEVICE)['name']}")
 
@@ -4725,47 +5203,13 @@ async def main():
     for line in describe_settings():
         print(line)
 
-    print("Microphone mode: XVF3800 adaptive dual-channel")
-
-    print("Reconnect: enabled")
-
-    print(
-        "Playback: "
-        + (f"streaming (pre-buffer {PLAYBACK_PREBUFFER_SECONDS:.1f}s)" if STREAMING_PLAYBACK else "buffered")
-    )
-
-    print(f"Speaker verification: {SPEAKER_VERIFY_MODE}")
-
-    print("Local timers: enabled")
-
-    print("Persistent alarms: enabled")
-
-    print("Relative alarms: enabled")
-
-    print(f"Alarm file: {ALARMS_FILE}")
-
-    print(f"Timer file: {TIMERS_FILE}")
-
-    print(f"Settings file: {SETTINGS_FILE}")
-
     saved_location = load_settings().get("location")
 
-    if saved_location:
-        print("Saved location: configured")
-    else:
-        print("Saved location: not set")
-
-    print("Weather: Open-Meteo enabled")
-
-    print("Current clock tool: enabled")
-
-    print("Barge-in: continuous-capture AEC-reference Hey Nexus interruption enabled")
-
-    print(f"Barge debug: {'enabled' if BARGE_DEBUG else 'disabled (NEXUS_BARGE_DEBUG=1)'}")
-
-    print(f"Follow-up window: {FOLLOWUP_SECONDS:.0f}s")
+    print(f"Saved location: {'configured' if saved_location else 'not set'}")
 
     print()
+
+    set_status("starting")
 
     if Path(RESPEAKER_ROUTE_HELPER).exists():
         print("Restoring normal ReSpeaker route...")
@@ -4817,14 +5261,47 @@ async def main():
 
     await asyncio.to_thread(open_reference_output)
 
+    # The microphone loop runs for the life of the process, with or
+    # without a connection, so the wake phrase is always heard.
+    tasks = [
+        asyncio.create_task(
+            process_microphone(
+                controller.link,
+                wake_models,
+                controller,
+            )
+        ),
+        asyncio.create_task(status_heartbeat()),
+        asyncio.create_task(
+            connection_manager(
+                api_key,
+                controller,
+            )
+        ),
+    ]
+
+    print()
+    print('Waiting for "Hey Nexus"...')
+
     try:
-        await connection_manager(
-            api_key,
-            wake_models,
-            controller,
+        done, pending = await asyncio.wait(
+            tasks,
+            return_when=asyncio.FIRST_COMPLETED,
         )
 
+        for task in done:
+            if task.exception() is not None:
+                raise task.exception()
+
     finally:
+        for task in tasks:
+            task.cancel()
+
+        await asyncio.gather(
+            *tasks,
+            return_exceptions=True,
+        )
+
         await asyncio.to_thread(close_reference_output)
 
         await asyncio.to_thread(close_input_stream)
