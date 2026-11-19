@@ -398,6 +398,12 @@ PLAYER_STALL_SECONDS = env_float(
     "Stop a reply's playback after this long with no audio arriving (0 = no limit).",
 )
 
+SPEAKER_FAIL_LIMIT = env_int(
+    "NEXUS_SPEAKER_FAIL_LIMIT",
+    3,
+    "Failed replies in a row before the speaker is reported broken and Nexus restarts (0 = never).",
+)
+
 # --- Failing loudly -------------------------------------------------
 
 OFFLINE_NOTICES = env_flag(
@@ -3687,17 +3693,10 @@ async def run_player(
     except Exception as exc:
         # Local audio failures must not discard a healthy Realtime
         # session or trigger network reconnection.
-        print(f"Response playback failed; keeping Realtime connected: {type(exc).__name__}: {exc}")
-
         if controller.player is player:
             controller.player = None
 
-        try:
-            await clear_openai_input(ws)
-        except Exception:
-            pass
-
-        controller.return_to_wake()
+        await note_playback_failure(ws, controller, player.response_id, exc)
         return
 
     finally:
@@ -3731,6 +3730,8 @@ async def run_player(
         # The cancel is on its way; a new request must not have to wait
         # for the server to confirm it.
         controller.response_active = False
+
+    controller.playback_failures = 0
 
     if not player.followup and not interrupted:
         # Lead-in finished; keep waiting for the answer.
@@ -3825,6 +3826,7 @@ class NexusController:
         self.current_response_id = None
         self.cancelled_response_id = None
         self.cancel_next_response = False
+        self.playback_failures = 0
 
     def enter_active(
         self,
@@ -3990,6 +3992,45 @@ async def give_up_on_reply(ws, controller, reason):
     controller.return_to_wake()
 
     run_in_background(play_notice("error"))
+
+
+async def note_playback_failure(ws, controller, response_id, exc):
+    """The speaker could not play a reply.
+
+    Cancel the reply so no more of it is generated (and paid for) or
+    retried chunk by chunk, and count the failure: several in a row mean
+    the speaker is gone, which a clean restart may cure and the owner
+    must hear about.
+    """
+    print(f"Response playback failed; keeping Realtime connected: {type(exc).__name__}: {exc}")
+
+    controller.playback_failures += 1
+
+    if response_id is not None:
+        controller.cancelled_response_id = response_id
+
+    if controller.response_active:
+        controller.response_active = False
+
+        try:
+            await ws.send(json.dumps({"type": "response.cancel"}))
+        except Exception:
+            pass
+
+    try:
+        await clear_openai_input(ws)
+    except Exception:
+        pass
+
+    controller.return_to_wake()
+
+    if SPEAKER_FAIL_LIMIT > 0 and controller.playback_failures >= SPEAKER_FAIL_LIMIT:
+        set_status(
+            "problem",
+            "speaker",
+            f"{controller.playback_failures} replies in a row could not be played: {exc}",
+        )
+        hard_exit("the speaker output keeps failing")
 
 
 async def score_speaker(
@@ -4773,13 +4814,13 @@ async def receive_events(
                         audio_copy,
                         controller,
                     )
-                except sd.PortAudioError:
+                except sd.PortAudioError as exc:
                     # Local audio failures must not discard a healthy
                     # Realtime session or trigger network reconnection.
-                    print("Response playback failed; keeping Realtime connected.")
-                    await clear_openai_input(ws)
-                    controller.return_to_wake()
+                    await note_playback_failure(ws, controller, None, exc)
                     continue
+
+                controller.playback_failures = 0
 
                 await open_followup(
                     ws,

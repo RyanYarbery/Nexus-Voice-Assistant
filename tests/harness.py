@@ -128,6 +128,9 @@ DEFAULTS = {
 }
 ns.update(DEFAULTS)
 
+exits = []  # reasons the code under test asked for a clean restart
+ns["hard_exit"] = exits.append
+
 A = ns["AssistantState"]
 
 
@@ -228,6 +231,7 @@ async def _scenario(body):
     for k in written:
         written[k] = [] if isinstance(written[k], list) else 0
     played.clear()
+    exits.clear()
     script["wake"] = 0.0
     script["speaker"] = 0.6
     controller.link.attach(ws)

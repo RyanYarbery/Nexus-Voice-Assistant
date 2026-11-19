@@ -249,3 +249,37 @@ def test_a_interrupted_lead_in_drops_the_answer_that_follows():
         assert not h.speaking() and c.player is None, "the answer played over the new request"
 
     scenario(body)
+
+
+def test_d_speaker_failing_three_replies_in_a_row_is_reported_and_restarts():
+    async def body(ws, c):
+        orig = h.FakeStream.write
+
+        def bad(self, data):
+            if self.samplerate != 16000:
+                raise h.PortAudioError("device busy")
+            return orig(self, data)
+
+        h.FakeStream.write = bad
+        try:
+            for n in range(3):
+                assert h.exits == []
+                await feed_mic(5)
+                await h.to_wait_response(ws, c)
+                ws.push({"type": "response.created", "response": {"id": f"r{n}"}})
+                ws.push({"type": "response.output_audio.delta", "response_id": f"r{n}", "delta": b64(0.3)})
+                await wait_for(lambda: c.state == A.WAIT_WAKE, what="back to wake")
+                ws.push(
+                    {
+                        "type": "response.done",
+                        "response": {"id": f"r{n}", "status": "cancelled", "output": []},
+                    }
+                )
+                await asyncio.sleep(0.05)
+        finally:
+            h.FakeStream.write = orig
+        assert len(h.exits) == 1
+        assert ns["status"]["problem"] == "speaker"
+
+    scenario(body)
+    ns["set_status"]("ok")
