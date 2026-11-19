@@ -5,7 +5,9 @@ Put a Python file here and Nexus loads it at start. One file is one feature:
 ```python
 async def roll(arguments):
     import random
+
     return {"numbers": [random.randint(1, 6) for _ in range(arguments.get("count", 1))]}
+
 
 def register(nexus):
     nexus.tool(
