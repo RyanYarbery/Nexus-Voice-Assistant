@@ -82,15 +82,15 @@ def test_connection_dropping_mid_request_does_not_stop_the_microphone_loop():
 def _run_manager(error_text, seconds):
     attempts = []
 
-    async def failing_connection(api_key, controller):
+    async def failing_connection(controller):
         attempts.append(1)
         raise ConnectionError(error_text)
 
     async def body():
-        controller = ns["NexusController"](None, None, None)
+        controller = ns["NexusController"]()
         real = ns["run_connection"]
         ns["run_connection"] = failing_connection
-        task = asyncio.create_task(ns["connection_manager"]("key", controller))
+        task = asyncio.create_task(ns["connection_manager"](controller))
         try:
             await asyncio.sleep(seconds)
         finally:

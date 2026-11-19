@@ -43,3 +43,13 @@ echo_*.py
 .idea/
 .vscode/
 .DS_Store
+
+# Written by Nexus at run time
+status.json
+status.json.tmp
+COMMIT
+
+# Your own plugins and notice recordings stay on your machine
+plugins/*
+!plugins/README.md
+notices/
