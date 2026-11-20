@@ -40,6 +40,7 @@ for name in ("torch", "websockets", "openwakeword", "openwakeword.model",
              "speechbrain", "speechbrain.inference", "speechbrain.inference.speaker"):
     sys.modules[name] = types.ModuleType(name)
 sys.modules["torch"].load = None
+sys.modules["torch"].Tensor = type("Tensor", (), {})  # newer scipy probes torch.Tensor when designing filters
 sys.modules["openwakeword.model"].Model = type("Model", (), {})
 sys.modules["speechbrain.inference.speaker"].SpeakerRecognition = type("SR", (), {})
 

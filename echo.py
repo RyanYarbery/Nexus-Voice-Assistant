@@ -42,10 +42,16 @@ from speechbrain.inference.speaker import SpeakerRecognition
 # =========================================================
 
 INPUT_RATE = 16000
+# Rate the microphone array actually delivers. The XVF3800 48k2ch firmware (flashed
+# 2026-11-19 for full-band playback, ~/Work/Nexus/STATUS.md) captures at 48 kHz; Nexus
+# decimates to INPUT_RATE so wake word, speaker check and upload stay at 16 kHz.
+MIC_DEVICE_RATE = int(os.environ.get("NEXUS_MIC_DEVICE_RATE", str(INPUT_RATE)))
 MODEL_RATE = 24000
 OUTPUT_RATE = 48000
 # Verified USB playback format: 16 kHz, stereo, signed 16-bit PCM.
-AEC_REFERENCE_RATE = 16000
+# Playback rate to the array (its 3.5 mm jack feeds the speakers and its AEC). 16000 on the
+# old 16 kHz firmware; 48000 with the 48k2ch firmware for full-band speech.
+AEC_REFERENCE_RATE = int(os.environ.get("NEXUS_AEC_REFERENCE_RATE", "16000"))
 
 BASE_DIR = Path(
     os.environ.get(
@@ -687,8 +693,8 @@ def open_input_stream():
             return
 
         stream = sd.InputStream(
-            samplerate=INPUT_RATE,
-            blocksize=INPUT_BLOCK_FRAMES,
+            samplerate=MIC_DEVICE_RATE,
+            blocksize=INPUT_BLOCK_FRAMES * MIC_DECIMATION,
             device=INPUT_DEVICE,
             channels=2,
             dtype="int16",
@@ -854,6 +860,31 @@ def block_rms(
     )
 
 
+class StreamDecimator:
+    """Integer-factor decimation for a continuous stream: low-pass FIR with state
+    carried across blocks (no edge clicks), then keep every Nth sample."""
+
+    def __init__(self, factor, rate_out):
+        from scipy.signal import firwin, lfilter, lfilter_zi
+        self.factor = factor
+        self._lfilter = lfilter
+        self.taps = firwin(97, 0.45 * rate_out, fs=rate_out * factor)
+        self.state = lfilter_zi(self.taps, 1.0) * 0.0
+
+    def process(self, x):
+        y, self.state = self._lfilter(self.taps, 1.0, x.astype(np.float64), zi=self.state)
+        return np.clip(np.round(y[::self.factor]), -32768, 32767).astype(np.int16)
+
+
+if MIC_DEVICE_RATE % INPUT_RATE:
+    raise SystemExit(f"NEXUS_MIC_DEVICE_RATE {MIC_DEVICE_RATE} must be a multiple of {INPUT_RATE}")
+MIC_DECIMATION = MIC_DEVICE_RATE // INPUT_RATE
+mic_decimators = (
+    [StreamDecimator(MIC_DECIMATION, INPUT_RATE) for _ in range(2)]
+    if MIC_DECIMATION > 1 else None
+)
+
+
 def microphone_callback(
     indata,
     frames,
@@ -865,17 +896,21 @@ def microphone_callback(
             f"Microphone status: {status}"
         )
 
-    ch0 = (
-        indata[:, 0]
-        .copy()
-        .astype(np.int16)
-    )
+    if mic_decimators is not None:
+        ch0 = mic_decimators[0].process(indata[:, 0])
+        ch1 = mic_decimators[1].process(indata[:, 1])
+    else:
+        ch0 = (
+            indata[:, 0]
+            .copy()
+            .astype(np.int16)
+        )
 
-    ch1 = (
-        indata[:, 1]
-        .copy()
-        .astype(np.int16)
-    )
+        ch1 = (
+            indata[:, 1]
+            .copy()
+            .astype(np.int16)
+        )
 
     stereo_block = (
         ch0,
