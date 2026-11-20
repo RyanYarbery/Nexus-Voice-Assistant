@@ -139,7 +139,8 @@ HTTP_USER_AGENT = os.environ.get(
     "(personal non-commercial assistant)",
 )
 
-WAKE_THRESHOLD = 0.10
+# Settable since 2026-11-19 (wake-lab: community jul23 model runs at 0.5; ~/Work/Nexus/STATUS.md).
+WAKE_THRESHOLD = float(os.environ.get("NEXUS_WAKE_THRESHOLD", "0.10"))
 SPEAKER_THRESHOLD = 0.25
 
 INPUT_BLOCK_FRAMES = 1280
@@ -321,6 +322,55 @@ barge_in_event = threading.Event()
 
 input_stream_lock = threading.Lock()
 input_stream = None
+
+# Last few seconds of both channels while waiting for the wake word. Saved on every
+# wake so real false wakes (e.g. phone calls) can be trained against later (2026-11-19).
+WAKE_CLIP_SECONDS = 3.0
+WAKE_CLIP_MAX_FILES = 5000
+WAKE_CLIP_DIR = Path(os.environ.get("NEXUS_WAKE_CLIP_DIR", str(Path.home() / "echo" / "wake-clips")))
+SAVE_WAKE_CLIPS = os.environ.get("NEXUS_SAVE_WAKE_CLIPS", "1").strip().lower() not in ("0", "false", "no", "off")
+wake_clip_ring = deque(maxlen=max(1, int(WAKE_CLIP_SECONDS * INPUT_RATE / INPUT_BLOCK_FRAMES)))
+last_wake_clip = None
+
+
+def log_wake_event(kind, **fields):
+    """Append one line to wake-clips/events.jsonl; never let logging break Nexus."""
+    if not SAVE_WAKE_CLIPS:
+        return
+    try:
+        WAKE_CLIP_DIR.mkdir(parents=True, exist_ok=True)
+        fields.update(kind=kind, time=datetime.now().astimezone().isoformat(timespec="seconds"),
+                      clip=last_wake_clip)
+        with open(WAKE_CLIP_DIR / "events.jsonl", "a") as f:
+            f.write(json.dumps(fields) + "\n")
+    except Exception as exc:
+        print(f"WARNING: could not log wake event: {exc}")
+
+
+def save_wake_clip(score0, score1):
+    """Write the last WAKE_CLIP_SECONDS of both channels as a 16 kHz stereo WAV."""
+    global last_wake_clip
+    last_wake_clip = None
+    if not SAVE_WAKE_CLIPS or not wake_clip_ring:
+        return
+    try:
+        import wave
+        WAKE_CLIP_DIR.mkdir(parents=True, exist_ok=True)
+        name = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_w{score0:.2f}-{score1:.2f}.wav"
+        audio = np.stack([np.concatenate([b[0] for b in wake_clip_ring]),
+                          np.concatenate([b[1] for b in wake_clip_ring])], axis=1).astype(np.int16)
+        with wave.open(str(WAKE_CLIP_DIR / name), "wb") as w:
+            w.setnchannels(2)
+            w.setsampwidth(2)
+            w.setframerate(INPUT_RATE)
+            w.writeframes(audio.tobytes())
+        last_wake_clip = name
+        clips = sorted(WAKE_CLIP_DIR.glob("*.wav"))
+        for old in clips[:max(0, len(clips) - WAKE_CLIP_MAX_FILES)]:
+            old.unlink()
+    except Exception as exc:
+        print(f"WARNING: could not save wake clip: {exc}")
+
 
 wake_preroll = deque(
     maxlen=max(
@@ -4453,6 +4503,8 @@ async def verify_speaker(
         print(
             "Speaker rejected."
         )
+        log_wake_event("speaker_rejected", context=context, similarity_ch0=round(float(similarity0), 4),
+                       similarity_ch1=round(float(similarity1), 4))
         await reject_current_speaker(ws, controller)
         return False
 
@@ -4466,6 +4518,8 @@ async def verify_speaker(
     print(
         "Speaker accepted."
     )
+    log_wake_event("speaker_accepted", context=context, similarity_ch0=round(float(similarity0), 4),
+                   similarity_ch1=round(float(similarity1), 4))
 
     return True
 
@@ -4496,6 +4550,9 @@ async def process_microphone(
             == AssistantState.WAIT_WAKE
         ):
             wake_preroll.append(
+                block
+            )
+            wake_clip_ring.append(
                 block
             )
 
@@ -4546,6 +4603,11 @@ async def process_microphone(
                 f"CH1: {score1:.3f}   "
                 f"winner: CH{wake_winner}"
             )
+
+            save_wake_clip(score0, score1)
+            log_wake_event("wake", score_ch0=round(score0, 4), score_ch1=round(score1, 4),
+                           threshold=WAKE_THRESHOLD)
+            wake_clip_ring.clear()
 
             controller.verify_blocks = [
                 (b[0].copy(), b[1].copy())
@@ -4630,6 +4692,9 @@ async def process_microphone(
                 print(
                     "Speaker rejected."
                 )
+                log_wake_event("speaker_rejected", context="strict",
+                               similarity_ch0=round(float(similarity0), 4),
+                               similarity_ch1=round(float(similarity1), 4))
                 controller.return_to_wake(
                     rejected=True
                 )
@@ -4638,6 +4703,9 @@ async def process_microphone(
             print(
                 "Speaker accepted."
             )
+            log_wake_event("speaker_accepted", context="strict",
+                           similarity_ch0=round(float(similarity0), 4),
+                           similarity_ch1=round(float(similarity1), 4))
             print(
                 f"Using microphone channel {winner}."
             )

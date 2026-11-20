@@ -17,8 +17,15 @@
 set -u
 XVF=/usr/local/lib/nexus/xvf_host/xvf_host
 
+# Onboard class-D amp (JST speaker connector) OFF: X0D31 is the amp enable, low = on
+# (Seeed wiki / host_control README). With powered speakers on the 3.5 mm jack the amp
+# played Nexus a second time from the board (Ryan, 2026-11-19). Set 0 to use a JST speaker.
+amp_off() {
+    "$XVF" GPO_WRITE_VALUE 31 1
+}
+
 asr_route() {
-    "$XVF" AUDIO_MGR_OP_R 7 3 && "$XVF" AEC_ASROUTONOFF 1
+    "$XVF" AUDIO_MGR_OP_R 7 3 && "$XVF" AEC_ASROUTONOFF 1 && amp_off
 }
 
 case "${1:-}" in
@@ -40,12 +47,13 @@ case "${1:-}" in
 
     # Only for wake-recording round 2b (tools/wake_record.py), which turns it back on.
     asr-off)
-        "$XVF" AUDIO_MGR_OP_R 7 3 && "$XVF" AEC_ASROUTONOFF 0
+        "$XVF" AUDIO_MGR_OP_R 7 3 && "$XVF" AEC_ASROUTONOFF 0 && amp_off
         ;;
 
     status)
         "$XVF" AUDIO_MGR_OP_R
         "$XVF" AEC_ASROUTONOFF
+        "$XVF" GPO_READ_VALUES
         ;;
 
     *)
