@@ -1,0 +1,46 @@
+#!/bin/bash
+# Network watchdog for nexus (installed as /usr/local/sbin/nexus-netwatch, run every
+# minute by nexus-netwatch.timer as root).
+#
+# Why (2026-11-20): the BrosTrend RTL8821CU USB Wi-Fi stick hung ("firmware failed to
+# leave lps state", then USB -71 errors) on 2026-11-19 and the box sat all night with
+# no network while otherwise running fine; Ryan power-cycled it repeatedly. This
+# recovers on its own: after 3 failed minutes it re-plugs the stick in software,
+# after 10 it reboots (at most once an hour, never in the first 15 min after boot).
+set -u
+GATEWAY=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')
+GATEWAY=${GATEWAY:-192.168.1.1}
+STATE=/run/nexus-netwatch.fails
+STAMP=/var/lib/nexus-netwatch/last-reboot
+RESET_AT=3
+REBOOT_AT=10
+mkdir -p /var/lib/nexus-netwatch
+
+if ping -c 1 -W 3 "$GATEWAY" >/dev/null 2>&1 || ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1; then
+    [ -s "$STATE" ] && [ "$(cat "$STATE")" != 0 ] && echo "network back after $(cat "$STATE") failed checks"
+    echo 0 > "$STATE"
+    exit 0
+fi
+
+fails=$(( $(cat "$STATE" 2>/dev/null || echo 0) + 1 ))
+echo "$fails" > "$STATE"
+echo "cannot reach $GATEWAY (failed check $fails)"
+
+if [ "$fails" -eq "$RESET_AT" ] || [ "$fails" -eq $((RESET_AT + 3)) ]; then
+    for dev in /sys/bus/usb/devices/*; do
+        [ "$(cat "$dev/idVendor" 2>/dev/null):$(cat "$dev/idProduct" 2>/dev/null)" = "0bda:c811" ] || continue
+        echo "re-plugging Wi-Fi stick $(basename "$dev")"
+        echo 0 > "$dev/authorized"; sleep 3; echo 1 > "$dev/authorized"
+    done
+fi
+
+if [ "$fails" -ge "$REBOOT_AT" ]; then
+    up=$(cut -d. -f1 /proc/uptime)
+    last=$(cat "$STAMP" 2>/dev/null || echo 0)
+    now=$(date +%s)
+    if [ "$up" -gt 900 ] && [ $((now - last)) -gt 3600 ]; then
+        echo "network down for $fails minutes: rebooting"
+        echo "$now" > "$STAMP"
+        systemctl reboot
+    fi
+fi

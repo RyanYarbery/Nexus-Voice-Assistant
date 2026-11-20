@@ -1,0 +1,6 @@
+[Unit]
+Description=Nexus network watchdog (recover the USB Wi-Fi stick)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/nexus-netwatch

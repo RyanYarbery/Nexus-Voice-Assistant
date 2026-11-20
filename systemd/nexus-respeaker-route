@@ -24,8 +24,19 @@ amp_off() {
     "$XVF" GPO_WRITE_VALUE 31 1
 }
 
+# Dell internal speaker OFF: the speakers now hang off the array's jack, and the Dell's
+# own speaker played Nexus a second time (Ryan, 2026-11-19). Debian's 90-alsa-restore
+# udev rule is broken here ("GOTO ... has no matching label"), so a saved mute is NOT
+# restored at boot; set it every boot and every Nexus start instead. Never fails the helper.
+dell_speaker_off() {
+    amixer -q -c PCH sset Speaker mute >/dev/null 2>&1 || true
+}
+
 asr_route() {
     "$XVF" AUDIO_MGR_OP_R 7 3 && "$XVF" AEC_ASROUTONOFF 1 && amp_off
+    local rc=$?
+    dell_speaker_off
+    return $rc
 }
 
 case "${1:-}" in
