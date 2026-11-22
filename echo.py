@@ -3240,12 +3240,15 @@ async def get_weather_tool(
 # Temps = the ESPHome nodes' retained MQTT states on debian-server's
 # Mosquitto, read with a read-only "nexus" login (ACL on the server).
 # Settings live in ~/.config/echo/env (NEXUS_SOLAR_URL, NEXUS_MQTT_*).
+# The defaults use debian-server's Tailscale IP, not debian-server.local:
+# mDNS lookups from nexus (USB Wi-Fi stick) failed every time on 2026-11-21.
 # =========================================================
 
+DEBIAN_SERVER_TAILSCALE_IP = "100.111.41.71"
 SOLAR_MONITOR_URL = os.environ.get(
-    "NEXUS_SOLAR_URL", "http://debian-server.local:5000"
+    "NEXUS_SOLAR_URL", f"http://{DEBIAN_SERVER_TAILSCALE_IP}:5000"
 ).rstrip("/")
-PROPERTY_MQTT_HOST = os.environ.get("NEXUS_MQTT_HOST", "debian-server.local")
+PROPERTY_MQTT_HOST = os.environ.get("NEXUS_MQTT_HOST", DEBIAN_SERVER_TAILSCALE_IP)
 PROPERTY_MQTT_PORT = int(os.environ.get("NEXUS_MQTT_PORT", "1883"))
 PROPERTY_MQTT_USER = os.environ.get("NEXUS_MQTT_USER", "nexus")
 PROPERTY_MQTT_PASSWORD = os.environ.get("NEXUS_MQTT_PASSWORD", "")
