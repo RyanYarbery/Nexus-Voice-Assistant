@@ -3232,6 +3232,288 @@ async def get_weather_tool(
         }
 
 
+# =========================================================
+# SOLAR MONITOR + PROPERTY TEMPERATURES (read from debian-server)
+# Ryan 2026-11-21: "make it so nexus can check the solar monitor and
+# temperature sensors from the server so I can ask nexus about them".
+# Solar = the solar monitor's JSON API, proxied on debian-server :5000.
+# Temps = the ESPHome nodes' retained MQTT states on debian-server's
+# Mosquitto, read with a read-only "nexus" login (ACL on the server).
+# Settings live in ~/.config/echo/env (NEXUS_SOLAR_URL, NEXUS_MQTT_*).
+# =========================================================
+
+SOLAR_MONITOR_URL = os.environ.get(
+    "NEXUS_SOLAR_URL", "http://debian-server.local:5000"
+).rstrip("/")
+PROPERTY_MQTT_HOST = os.environ.get("NEXUS_MQTT_HOST", "debian-server.local")
+PROPERTY_MQTT_PORT = int(os.environ.get("NEXUS_MQTT_PORT", "1883"))
+PROPERTY_MQTT_USER = os.environ.get("NEXUS_MQTT_USER", "nexus")
+PROPERTY_MQTT_PASSWORD = os.environ.get("NEXUS_MQTT_PASSWORD", "")
+PROPERTY_MQTT_TIMEOUT_SECONDS = 4
+
+# ESPHome node name -> the name Ryan uses for it.
+PROPERTY_TEMP_NODES = (
+    ("temp-outside", "outside"),
+    ("temp-battery-room", "battery room"),
+    ("temp-well", "well"),
+)
+
+# PI30 inverter work modes (EG4 6500EX), as the solar monitor reports them.
+SOLAR_INVERTER_MODES = {
+    "P": "powering on",
+    "S": "standby",
+    "L": "running on grid power",
+    "B": "running on battery",
+    "F": "fault",
+    "H": "power saving",
+    "D": "shut down",
+}
+
+
+def _local_clock(iso_text):
+    if not iso_text:
+        return None
+    try:
+        return (
+            datetime.fromisoformat(iso_text)
+            .astimezone(local_timezone())
+            .strftime("%-I:%M %p")
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _kwh(wh):
+    if isinstance(wh, (int, float)):
+        return round(wh / 1000, 1)
+    return None
+
+
+def solar_status_sync():
+    latest = http_get_json(f"{SOLAR_MONITOR_URL}/api/latest", {})
+    try:
+        summary = http_get_json(f"{SOLAR_MONITOR_URL}/api/summary", {})
+    except Exception:
+        summary = {}
+
+    battery = summary.get("battery") or {}
+    today = summary.get("today") or {}
+    yesterday = summary.get("yesterday") or {}
+    battery_state = battery.get("state")  # charging | discharging | idle (<25 W)
+    battery_watts = latest.get("battery_watts")
+
+    if battery_state == "charging":
+        eta_meaning = "battery full"
+    elif battery_state == "discharging":
+        eta_meaning = "battery empty"
+    else:
+        eta_meaning = None
+
+    return {
+        "success": True,
+        "reading_age_seconds": latest.get("age_seconds"),
+        "stale": latest.get("stale"),
+        "battery_percent": latest.get("battery_soc"),
+        "battery_state": battery_state,
+        "battery_watts": (
+            abs(battery_watts)
+            if isinstance(battery_watts, (int, float))
+            else None
+        ),
+        "battery_capacity_kwh": summary.get("battery_capacity_kwh"),
+        "battery_eta_meaning": eta_meaning,
+        "battery_eta_local_time": _local_clock(battery.get("eta")),
+        "battery_eta_hours": battery.get("hours"),
+        "solar_watts": latest.get("pv_watts"),
+        "house_load_watts": latest.get("load_watts"),
+        "grid_present": latest.get("grid_present"),
+        "any_fault": latest.get("any_fault"),
+        "inverters": [
+            {
+                "inverter": inv.get("inverter_id"),
+                "mode": SOLAR_INVERTER_MODES.get(inv.get("mode"), inv.get("mode")),
+                "output_watts": inv.get("output_watts"),
+                "solar_watts": inv.get("pv_watts"),
+                "fault_code": inv.get("fault_code"),
+            }
+            for inv in latest.get("inverters") or []
+        ],
+        "today": {
+            "solar_kwh": _kwh(today.get("pv_wh")),
+            "used_kwh": _kwh(today.get("load_wh")),
+            "lowest_battery_percent": today.get("battery_soc_min"),
+            "peak_solar_watts": today.get("pv_peak_watts"),
+            "peak_solar_time": _local_clock(today.get("pv_peak_time")),
+        },
+        "yesterday": {
+            "solar_kwh": _kwh(yesterday.get("pv_energy_wh")),
+            "used_kwh": _kwh(yesterday.get("load_energy_wh")),
+            "lowest_battery_percent": yesterday.get("battery_soc_min"),
+        },
+    }
+
+
+async def get_solar_status_tool():
+    try:
+        return await asyncio.to_thread(solar_status_sync)
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": f"solar monitor unreachable at {SOLAR_MONITOR_URL}: "
+                     f"{type(exc).__name__}: {exc}",
+        }
+
+
+# A minimal MQTT 3.1.1 reader: connect, subscribe, collect the retained
+# messages, disconnect. Enough for a one-shot read and avoids a new dependency.
+
+def _mqtt_string(text):
+    data = text.encode("utf-8")
+    return len(data).to_bytes(2, "big") + data
+
+
+def _mqtt_packet(first_byte, body):
+    length = len(body)
+    encoded = bytearray()
+    while True:
+        digit = length % 128
+        length //= 128
+        if length:
+            digit |= 0x80
+        encoded.append(digit)
+        if not length:
+            break
+    return bytes([first_byte]) + bytes(encoded) + body
+
+
+def _mqtt_recv_exact(sock, count):
+    data = b""
+    while len(data) < count:
+        chunk = sock.recv(count - len(data))
+        if not chunk:
+            raise ConnectionError("broker closed the connection")
+        data += chunk
+    return data
+
+
+def _mqtt_read_packet(sock):
+    first = _mqtt_recv_exact(sock, 1)[0]
+    multiplier, length = 1, 0
+    while True:
+        byte = _mqtt_recv_exact(sock, 1)[0]
+        length += (byte & 0x7F) * multiplier
+        multiplier *= 128
+        if not byte & 0x80:
+            break
+    return first, _mqtt_recv_exact(sock, length)
+
+
+def mqtt_read_retained_sync(topics, timeout):
+    import socket
+
+    sock = socket.create_connection(
+        (PROPERTY_MQTT_HOST, PROPERTY_MQTT_PORT), timeout=timeout
+    )
+    try:
+        flags = 0x02 | 0x80 | 0x40  # clean session, username, password
+        client_id = f"nexus-{os.getpid()}-{int(time.time() * 1000) % 1000000}"
+        sock.sendall(_mqtt_packet(
+            0x10,
+            _mqtt_string("MQTT") + bytes([4, flags]) + (10).to_bytes(2, "big")
+            + _mqtt_string(client_id)
+            + _mqtt_string(PROPERTY_MQTT_USER)
+            + _mqtt_string(PROPERTY_MQTT_PASSWORD),
+        ))
+        first, body = _mqtt_read_packet(sock)
+        if first >> 4 != 2 or len(body) < 2 or body[1] != 0:
+            code = body[1] if len(body) > 1 else "?"
+            raise RuntimeError(f"broker refused the login (code {code})")
+
+        sock.sendall(_mqtt_packet(
+            0x82,
+            (1).to_bytes(2, "big")
+            + b"".join(_mqtt_string(t) + b"\x00" for t in topics),
+        ))
+
+        messages = {}
+        deadline = time.monotonic() + timeout
+        while len(messages) < len(topics):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock.settimeout(remaining)
+            try:
+                first, body = _mqtt_read_packet(sock)
+            except socket.timeout:
+                break
+            if first >> 4 != 3:  # not a PUBLISH (e.g. the SUBACK)
+                continue
+            topic_len = int.from_bytes(body[:2], "big")
+            topic = body[2:2 + topic_len].decode("utf-8", "replace")
+            payload = body[2 + topic_len:]
+            if (first >> 1) & 0x03:  # QoS > 0 carries a packet id
+                payload = payload[2:]
+            messages[topic] = payload.decode("utf-8", "replace").strip()
+
+        try:
+            sock.sendall(b"\xe0\x00")  # DISCONNECT
+        except OSError:
+            pass
+        return messages
+    finally:
+        sock.close()
+
+
+def property_temperatures_sync():
+    if not PROPERTY_MQTT_PASSWORD:
+        return {
+            "success": False,
+            "error": "NEXUS_MQTT_PASSWORD is not set in ~/.config/echo/env",
+        }
+
+    topics = []
+    for node, _label in PROPERTY_TEMP_NODES:
+        topics.append(f"{node}/sensor/temperature/state")
+        topics.append(f"{node}/status")
+
+    messages = mqtt_read_retained_sync(topics, PROPERTY_MQTT_TIMEOUT_SECONDS)
+
+    sensors = []
+    for node, label in PROPERTY_TEMP_NODES:
+        status = messages.get(f"{node}/status")
+        entry = {
+            "sensor": label,
+            "online": (status == "online") if status else None,
+        }
+        try:
+            celsius = float(messages.get(f"{node}/sensor/temperature/state"))
+            entry["temperature_f"] = round(celsius * 9 / 5 + 32, 1)
+            entry["temperature_c"] = round(celsius, 1)
+        except (TypeError, ValueError):
+            entry["temperature_f"] = None
+            entry["note"] = "no reading on the server"
+        if status == "offline":
+            entry["note"] = "sensor is offline; this is its last reading"
+        sensors.append(entry)
+
+    return {
+        "success": True,
+        "say_units": "Fahrenheit unless the user asks for Celsius",
+        "sensors": sensors,
+    }
+
+
+async def get_property_temperatures_tool():
+    try:
+        return await asyncio.to_thread(property_temperatures_sync)
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": f"temperature sensors unreachable on {PROPERTY_MQTT_HOST}: "
+                     f"{type(exc).__name__}: {exc}",
+        }
+
+
 def redact_tool_log(
     name,
     value,
@@ -3292,6 +3574,12 @@ async def execute_tool(
                 0,
             )
         )
+
+    if name == "get_solar_status":
+        return await get_solar_status_tool()
+
+    if name == "get_property_temperatures":
+        return await get_property_temperatures_tool()
 
     if name == "set_timer":
         return await set_local_timer(
@@ -5620,6 +5908,42 @@ async def configure_session(
                                         ),
                                 },
                             },
+                        },
+                    },
+
+                    {
+                        "type": "function",
+                        "name": "get_solar_status",
+                        "description": (
+                            "Get the home's off-grid solar system right now "
+                            "from the solar monitor: battery percent, whether "
+                            "it is charging or discharging and how fast, when "
+                            "it will be full or empty, solar watts, house load, "
+                            "grid present, inverter modes and faults, plus "
+                            "today's and yesterday's solar and usage in kWh. "
+                            "Use for any question about the solar, the "
+                            "batteries, power use or the inverters."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {},
+                        },
+                    },
+
+                    {
+                        "type": "function",
+                        "name": "get_property_temperatures",
+                        "description": (
+                            "Get the current readings of the property's "
+                            "temperature sensors: outside, the battery room "
+                            "and the well, with whether each sensor is online. "
+                            "Use for questions like how cold it is outside, "
+                            "the battery room temperature, or whether the "
+                            "well could freeze."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {},
                         },
                     },
 
