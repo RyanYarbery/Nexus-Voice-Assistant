@@ -3252,7 +3252,10 @@ PROPERTY_MQTT_HOST = os.environ.get("NEXUS_MQTT_HOST", DEBIAN_SERVER_TAILSCALE_I
 PROPERTY_MQTT_PORT = int(os.environ.get("NEXUS_MQTT_PORT", "1883"))
 PROPERTY_MQTT_USER = os.environ.get("NEXUS_MQTT_USER", "nexus")
 PROPERTY_MQTT_PASSWORD = os.environ.get("NEXUS_MQTT_PASSWORD", "")
-PROPERTY_MQTT_TIMEOUT_SECONDS = 4
+# nexus's USB Wi-Fi drops packets now and then (2026-11-21: a 4 s single try
+# timed out while the next 10 tries took 0.05 s), so: two tries of 6 s each.
+PROPERTY_MQTT_TIMEOUT_SECONDS = 6
+PROPERTY_MQTT_ATTEMPTS = 2
 
 # ESPHome node name -> the name Ryan uses for it.
 PROPERTY_TEMP_NODES = (
@@ -3479,7 +3482,16 @@ def property_temperatures_sync():
         topics.append(f"{node}/sensor/temperature/state")
         topics.append(f"{node}/status")
 
-    messages = mqtt_read_retained_sync(topics, PROPERTY_MQTT_TIMEOUT_SECONDS)
+    for attempt in range(1, PROPERTY_MQTT_ATTEMPTS + 1):
+        try:
+            messages = mqtt_read_retained_sync(
+                topics, PROPERTY_MQTT_TIMEOUT_SECONDS
+            )
+            break
+        except (OSError, ConnectionError):
+            if attempt == PROPERTY_MQTT_ATTEMPTS:
+                raise
+            time.sleep(0.5)
 
     sensors = []
     for node, label in PROPERTY_TEMP_NODES:
