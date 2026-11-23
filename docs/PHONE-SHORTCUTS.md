@@ -29,8 +29,8 @@ Replace `nexus` with the box's Tailscale name or address and `TOKEN` with the to
 | `http://nexus:8377/stop?token=TOKEN&for=1h30m` | Same, with `s`, `m`, `h`, `d` units |
 | `http://nexus:8377/resume?token=TOKEN` | Ends the silence early |
 | `http://nexus:8377/status?token=TOKEN` | Says whether it is silent and for how long |
-| `http://nexus:8377/restart?token=TOKEN` | Restarts the assistant only (about 40 seconds) |
-| `http://nexus:8377/reboot?token=TOKEN` | Reboots the whole box |
+| `http://nexus:8377/restart?token=TOKEN` | Restarts the assistant only (back in about 25 seconds) |
+| `http://nexus:8377/reboot?token=TOKEN` | Reboots the whole box (back in about 95 seconds, measured 2026-11-23) |
 
 While silent, Nexus ignores the wake word and drops any reply that was on its way. Timers and alarms
 still ring; calling `/stop` again quiets one that is ringing. `/stop` with no time (or 0) silences for
