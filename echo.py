@@ -4,6 +4,8 @@ os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"
 
 import asyncio
 import base64
+import hmac
+import ipaddress
 import json
 import math
 import queue
@@ -13,6 +15,7 @@ import time
 import warnings
 import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -328,6 +331,398 @@ barge_in_event = threading.Event()
 
 input_stream_lock = threading.Lock()
 input_stream = None
+
+
+# =========================================================
+# PHONE CONTROL (stop + silence, restart, reboot)
+# =========================================================
+# Ryan, 2026-11-22: "i want a shortcut on my phone that will immediately stop
+# nexus mid sentence and silence it for however long i pass to it. also a
+# shortcut that will reboot it." Reasons and choices: ~/Work/Nexus/STATUS.md
+# "Phone shortcuts". Off unless NEXUS_CONTROL_TOKEN is set.
+#
+#   GET /stop?minutes=20&token=...   stop talking now, stay silent 20 minutes
+#   GET /stop?for=1h30m&token=...    same, with s / m / h / d units
+#   GET /resume?token=...            end the silence early
+#   GET /status?token=...
+#   GET /restart?token=...           restart the assistant only (systemd)
+#   GET /reboot?token=...            reboot the whole box
+#
+# The server runs in its own thread, so stop and reboot still work when the
+# asyncio loop is stuck. While silent: the wake word is ignored and replies
+# are dropped. Timers and alarms STILL ring (a missed alarm is worse than a
+# beep); /stop again quiets one that is ringing.
+CONTROL_TOKEN = os.environ.get("NEXUS_CONTROL_TOKEN", "").strip()
+CONTROL_HOST = os.environ.get("NEXUS_CONTROL_HOST", "0.0.0.0")
+CONTROL_PORT = int(os.environ.get("NEXUS_CONTROL_PORT", "8377"))
+
+# Callers outside these networks are refused before the token is looked at.
+# Default: Tailscale addresses and the box itself.
+CONTROL_ALLOW = [
+    ipaddress.ip_network(part.strip())
+    for part in os.environ.get(
+        "NEXUS_CONTROL_ALLOW",
+        "100.64.0.0/10,127.0.0.0/8,fd7a:115c:a1e0::/48,::1/128",
+    ).split(",")
+    if part.strip()
+]
+
+SILENCE_FILE = Path(
+    os.environ.get(
+        "NEXUS_SILENCE_FILE",
+        str(BASE_DIR / "silence.json"),
+    )
+)
+
+# Every stop silences for at least this long, so a reply that was already on
+# its way (a tool answer, a late audio packet) cannot start talking again.
+SILENCE_MIN_SECONDS = 5.0
+SILENCE_MAX_SECONDS = 7 * 24 * 3600.0
+
+REBOOT_COMMAND = ["sudo", "-n", "/usr/bin/systemctl", "reboot"]
+
+# Wall-clock time (time.time()) until which Nexus stays silent. Saved to
+# SILENCE_FILE so a restart or power blip does not end the silence early.
+silence_until = 0.0
+
+control_loop = None
+control_controller = None
+
+
+def silence_remaining():
+    return max(0.0, silence_until - time.time())
+
+
+def silence_active():
+    return time.time() < silence_until
+
+
+def parse_silence_duration(text):
+    """'20' -> 20 minutes; '90s', '20m', '2h', '1h30m' also work. Seconds."""
+    text = str(text or "").strip().lower().replace(" ", "")
+
+    if not text:
+        return 0.0
+
+    try:
+        minutes = float(text)
+    except ValueError:
+        minutes = None
+
+    if minutes is not None:
+        if not math.isfinite(minutes):
+            raise ValueError(f"cannot read duration {text!r}")
+
+        return max(0.0, minutes * 60.0)
+
+    units = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
+    total = 0.0
+    number = ""
+
+    for char in text:
+        if char.isdigit() or char == ".":
+            number += char
+        elif char in units and number:
+            total += float(number) * units[char]
+            number = ""
+        else:
+            raise ValueError(f"cannot read duration {text!r}")
+
+    if number:
+        raise ValueError(f"cannot read duration {text!r}")
+
+    return total
+
+
+def set_silence(seconds):
+    global silence_until
+
+    silence_until = (
+        time.time() + seconds if seconds > 0 else 0.0
+    )
+
+    try:
+        SILENCE_FILE.write_text(
+            json.dumps({"until": silence_until})
+        )
+    except OSError as exc:
+        print(f"WARNING: could not save {SILENCE_FILE}: {exc}", flush=True)
+
+
+def load_silence():
+    global silence_until
+
+    try:
+        until = float(json.loads(SILENCE_FILE.read_text()).get("until", 0.0))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return
+
+    # A clock that jumped backwards must not leave Nexus mute for years.
+    if time.time() < until <= time.time() + SILENCE_MAX_SECONDS:
+        silence_until = until
+        print(
+            "Silenced by phone control for another "
+            f"{format_duration(silence_remaining())}.",
+            flush=True,
+        )
+
+
+async def stop_now(controller):
+    """Runs on the event loop after /stop: end whatever Nexus is doing."""
+    player = controller.player
+    ws = controller.ws
+
+    if player is not None:
+        # run_player cancels the server reply; open_followup sees the
+        # silence and returns to waiting instead of listening.
+        player.abort()
+        return
+
+    if controller.state == AssistantState.WAIT_WAKE:
+        return
+
+    if ws is not None:
+        try:
+            await clear_openai_input(ws)
+        except Exception:
+            pass
+
+        if controller.response_active:
+            if controller.current_response_id:
+                controller.cancelled_response_id = (
+                    controller.current_response_id
+                )
+
+            try:
+                await ws.send(
+                    json.dumps({"type": "response.cancel"})
+                )
+            except Exception:
+                pass
+
+    controller.return_to_wake()
+
+
+def control_stop(seconds):
+    seconds = min(
+        max(seconds, SILENCE_MIN_SECONDS),
+        SILENCE_MAX_SECONDS,
+    )
+
+    set_silence(seconds)
+
+    # The playback thread and the beep loop both watch this flag, so sound
+    # stops within one 50 ms chunk even if the event loop is busy.
+    was_speaking = assistant_speaking.is_set()
+
+    if was_speaking:
+        barge_in_event.set()
+
+    loop = control_loop
+    controller = control_controller
+
+    if loop is not None and controller is not None:
+        asyncio.run_coroutine_threadsafe(
+            stop_now(controller),
+            loop,
+        )
+
+    print(
+        "PHONE CONTROL: stop"
+        + (" (was speaking)" if was_speaking else "")
+        + f", silent for {format_duration(seconds)}.",
+        flush=True,
+    )
+
+    return {
+        "ok": True,
+        "was_speaking": was_speaking,
+        "silent_seconds": round(seconds),
+        "message": f"Nexus is silent for {format_duration(seconds)}.",
+    }
+
+
+def control_status():
+    controller = control_controller
+    remaining = silence_remaining()
+
+    return {
+        "ok": True,
+        "silent": remaining > 0,
+        "silent_seconds": round(remaining),
+        "speaking": assistant_speaking.is_set(),
+        "state": controller.state if controller is not None else "starting",
+        "message": (
+            f"Silent for another {format_duration(remaining)}."
+            if remaining > 0
+            else "Nexus is listening."
+        ),
+    }
+
+
+def control_reboot():
+    # Ask sudo first, so a missing sudoers line is reported to the phone
+    # instead of a reboot that never happens.
+    try:
+        allowed = subprocess.run(
+            ["sudo", "-n", "-l"] + REBOOT_COMMAND[2:],
+            capture_output=True,
+            timeout=10,
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        allowed = False
+
+    if not allowed:
+        return 500, {
+            "ok": False,
+            "message":
+                "Reboot is not allowed for this user "
+                "(install systemd/nexus-control.sudoers).",
+        }
+
+    def later():
+        time.sleep(1.0)
+        subprocess.run(REBOOT_COMMAND, timeout=30)
+
+    print("PHONE CONTROL: reboot requested.", flush=True)
+    threading.Thread(target=later, daemon=True).start()
+
+    return 200, {"ok": True, "message": "Nexus is rebooting."}
+
+
+def control_restart():
+    def later():
+        time.sleep(1.0)
+        # Same exit the handshake watchdog uses: systemd (Restart=always)
+        # starts a fresh process even if audio shutdown would hang.
+        os._exit(1)
+
+    print("PHONE CONTROL: restart requested.", flush=True)
+    threading.Thread(target=later, daemon=True).start()
+
+    return {"ok": True, "message": "Nexus is restarting."}
+
+
+class ControlHandler(BaseHTTPRequestHandler):
+    server_version = "Nexus"
+    sys_version = ""
+
+    def log_message(self, format, *args):
+        pass
+
+    def reply(self, status, body):
+        data = (json.dumps(body) + "\n").encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def handle_request(self):
+        try:
+            address = ipaddress.ip_address(self.client_address[0])
+            address = getattr(address, "ipv4_mapped", None) or address
+        except ValueError:
+            address = None
+
+        if address is None or not any(
+            address in network for network in CONTROL_ALLOW
+        ):
+            return self.reply(403, {"ok": False, "message": "Not allowed."})
+
+        parsed = urllib.parse.urlsplit(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+
+        def arg(name):
+            return (query.get(name) or [""])[0]
+
+        token = arg("token") or self.headers.get("X-Nexus-Token", "")
+
+        if not hmac.compare_digest(
+            token.encode(), CONTROL_TOKEN.encode()
+        ):
+            return self.reply(401, {"ok": False, "message": "Wrong token."})
+
+        action = parsed.path.strip("/")
+
+        if action == "stop":
+            try:
+                seconds = (
+                    parse_silence_duration(arg("minutes"))
+                    + parse_silence_duration(arg("for"))
+                )
+            except ValueError as exc:
+                return self.reply(400, {"ok": False, "message": str(exc)})
+
+            return self.reply(200, control_stop(seconds))
+
+        if action == "resume":
+            set_silence(0)
+            print("PHONE CONTROL: silence ended.", flush=True)
+            return self.reply(
+                200, {"ok": True, "message": "Nexus is listening."}
+            )
+
+        if action == "status":
+            return self.reply(200, control_status())
+
+        if action == "restart":
+            return self.reply(200, control_restart())
+
+        if action == "reboot":
+            return self.reply(*control_reboot())
+
+        return self.reply(404, {"ok": False, "message": "Unknown action."})
+
+    def do_GET(self):
+        self.handle_request()
+
+    def do_POST(self):
+        self.handle_request()
+
+
+def start_control_server(loop, controller):
+    global control_loop, control_controller
+
+    control_loop = loop
+    control_controller = controller
+
+    if not CONTROL_TOKEN:
+        print("Phone control: disabled (NEXUS_CONTROL_TOKEN not set)")
+        return None
+
+    def serve():
+        # The port can be busy for a moment after a restart; keep trying.
+        while True:
+            try:
+                server = ThreadingHTTPServer(
+                    (CONTROL_HOST, CONTROL_PORT),
+                    ControlHandler,
+                )
+            except OSError as exc:
+                print(
+                    f"Phone control: cannot listen on port {CONTROL_PORT} "
+                    f"({exc}); retrying in 10 s.",
+                    flush=True,
+                )
+                time.sleep(10)
+                continue
+
+            server.daemon_threads = True
+            print(
+                f"Phone control: listening on {CONTROL_HOST}:{CONTROL_PORT}",
+                flush=True,
+            )
+            server.serve_forever()
+
+    thread = threading.Thread(
+        target=serve,
+        name="nexus-control",
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 # Last few seconds of both channels while waiting for the wake word. Saved on every
 # wake so real false wakes (e.g. phone calls) can be trained against later (2026-11-19).
@@ -4413,6 +4808,16 @@ async def open_followup(
     controller,
     interrupted,
 ):
+    if silence_active():
+        # Stopped from the phone: no follow-up window, back to waiting.
+        try:
+            await clear_openai_input(ws)
+        except Exception:
+            pass
+
+        controller.return_to_wake()
+        return
+
     controller.start_followup(
         interrupted=interrupted
     )
@@ -4561,6 +4966,9 @@ class NexusController:
         self.player = None
         self.current_response_id = None
         self.cancelled_response_id = None
+
+        # Live Realtime socket, for stop_now() (phone control).
+        self.ws = None
 
 
     def enter_active(
@@ -4910,6 +5318,11 @@ async def process_microphone(
                 time.monotonic()
                 < controller.wake_cooldown_until
             ):
+                continue
+
+            # Silenced from the phone (PHONE CONTROL above): the wake
+            # word is ignored until the silence runs out.
+            if silence_active():
                 continue
 
             best_score = max(
@@ -5402,6 +5815,26 @@ async def receive_events(
             )
 
             if not delta:
+                continue
+
+            if silence_active():
+                # Silenced from the phone: drop the audio and tell the
+                # server to stop making it (once per reply).
+                silenced_id = message.get("response_id")
+
+                if silenced_id != controller.cancelled_response_id:
+                    controller.cancelled_response_id = silenced_id
+
+                    try:
+                        await ws.send(
+                            json.dumps({"type": "response.cancel"})
+                        )
+                    except Exception:
+                        pass
+
+                    if controller.state != AssistantState.WAIT_WAKE:
+                        controller.return_to_wake()
+
                 continue
 
             if not STREAMING_PLAYBACK:
@@ -6308,6 +6741,7 @@ async def run_connection(
         )
 
         controller.reset_for_connection()
+        controller.ws = ws
 
         await configure_session(
             ws
@@ -6373,6 +6807,7 @@ async def run_connection(
                 return_exceptions=True,
             )
 
+            controller.ws = None
             controller.reset_for_connection()
 
 
@@ -6718,6 +7153,13 @@ async def main():
         recognizer,
         enrolled_ch0,
         enrolled_ch1,
+    )
+
+    load_silence()
+
+    start_control_server(
+        asyncio.get_running_loop(),
+        controller,
     )
 
     await restore_alarms()
